@@ -240,13 +240,52 @@ static void test_short_bulk_control_response(void)
     uint8_t command=WD_CMD_REMOTE,out[64];
     assert(dispatch(&command,1,out,sizeof(out))==3 && out[2]==WD_STATUS_INVALID);
 }
+/* A synthesized timeout reply must keep the exact response shape of its command:
+ * a host parses the short packet by command, so a malformed one desynchronises
+ * it instead of failing it. DAP_TransferBlock (0x06) used to answer
+ * {0x06, count=0, response=0x00}, i.e. "OK, zero words transferred", and
+ * DAP_SWD_Sequence (0x1d) answered two bytes instead of three. */
+static void test_timeout_reply_shapes(void)
+{
+    static const uint8_t command[]={0x06,0x1d,0x05,0x0a,0x10,0x02};
+    static const uint8_t expected[][3]={ {0x06,0x00,0x08}, {0x1d,0x00,0x08}, {0x05,0x00,0x08},
+                                        {0x0a,0xff,0x00}, {0x10,0x80,0x00}, {0x02,0x00,0x00} };
+    static const uint8_t length[]={3,3,3,3,2,2};
+    for(unsigned i=0;i<sizeof(command);++i) {
+        reset_app();dap_request(command[i]);step(10);assert(phase==2);
+        step(1510);assert(fault && phase==3 && link_timeouts==1);
+        step(1511);
+        assert(mock_dap_response_len==length[i]);
+        assert(!memcmp(mock_dap_response,expected[i],length[i]));
+        assert(mock_response_tag==mock_generation);
+    }
+}
+/* A saturated RTO makes retry_delay() a flat 400 ms, which fits only four
+ * transmissions inside REQUEST_TIMEOUT_MS; four consecutive lost frames then
+ * latched the global fault in the field. host_poll() now caps each interval so
+ * RETRY_ATTEMPTS_IN_BUDGET more transmissions still fit the same deadline. */
+static void test_retry_budget_survives_saturated_rto(void)
+{
+    reset_app();
+    retry.rto=400;retry.srtt=300;retry.variance=25; /* measured field saturation */
+    dap_request(0x05);step(10);assert(phase==2);
+    unsigned sends=0;
+    for(uint32_t now=11;now<1500;now+=10) {
+        unsigned before=mock_rf_tx_count;
+        step(now);
+        if(mock_rf_tx_count!=before) ++sends;
+    }
+    assert(!fault);
+    assert(sends>=12); /* 3 retransmissions before the clamp, ~15 after */
+}
 int main(void)
 {
     test_real_main_startup();test_shared_dap_cdc_sequence();
     test_cached_uart_reply_and_busy_configuration();test_partial_tx_and_dtr_drain();
     test_cdc_rx_backpressure();test_cdc_credit_and_closing_rx_drain();
     test_short_bulk_control_response();test_invalid_settings_and_pending_close();
+    test_timeout_reply_shapes();test_retry_budget_survives_saturated_rto();
     test_timeout_fault_lock_and_generation();test_generation_discards_inflight_cdc();
-    puts("App tests passed: real startup, shared DAP/CDC sequence, cached UART replies, partial TX, DTR drain, RX backpressure, invalid coding, timeout lock, generation isolation");
+    puts("App tests passed: real startup, shared DAP/CDC sequence, cached UART replies, partial TX, DTR drain, RX backpressure, invalid coding, timeout lock, timeout reply shapes, retry budget, generation isolation");
     return 0;
 }

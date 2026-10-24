@@ -18,6 +18,9 @@
 #define WD_ROLE_POLICY RF_CONFIG_ROLE_AUTO
 #endif
 #define REQUEST_TIMEOUT_MS 1500u
+/* Transmissions that must still fit inside the remaining budget when the retry
+ * interval is capped. See the retry clamp in host_poll(). */
+#define RETRY_ATTEMPTS_IN_BUDGET 16u
 #define DISCOVERY_MS 1000u
 #define UART_INTERVAL_MS 10u
 static rf_config_t settings;
@@ -170,13 +173,29 @@ static void reset_dispatch(void) {
     dap_init();
     /* UART closure is cooperative; no FIFO flush or duplicated target bytes. */
 }
+/* A timed-out request may already have executed, so the reply must not invite a
+ * blind replay. It must still have the exact response shape of its command: the
+ * host parses the short packet by command, and a malformed one desynchronises
+ * it instead of failing it. DAP_TransferBlock used to answer
+ * {0x06, count=0, response=0x00} which reads as "OK, zero words transferred",
+ * so a host streaming a framebuffer with 0x06 could spin on a false success
+ * rather than fail. 0x08 is DAP_TRANSFER_PROTOCOL_ERROR. */
 static void fail_request(bool uncertain) {
     memset(response,0,sizeof(response));response_len=2;response[0]=request[0];response[1]=0xff;
-    if(request[0]==0 || request[0]==2) response[1]=0;
-    if(request[0]==5) {response[1]=0;response[2]=8;response_len=3;}
-    if(request[0]==6) {response[1]=response[2]=0;response[3]=8;response_len=4;}
-    if(request[0]==0x0a) {response[2]=0;response_len=3;}
-    if(request[0]==0x10) response[1]=0x80;
+    switch(request[0]) {
+    case 0x00: /* DAP_Info: acknowledge with a zero-length info field. */
+    case 0x02: /* DAP_Connect: report no port connected. */
+        response[1]=0;break;
+    case 0x05: /* DAP_Transfer: TransferCount 0, TransferResponse error. */
+    case 0x06: /* DAP_TransferBlock: identical shape, never a false OK. */
+    case 0x1d: /* DAP_SWD_Sequence: SequenceCount 0, SequenceResponse error. */
+        response[1]=0;response[2]=8;response_len=3;break;
+    case 0x0a: /* DAP_ResetTarget: failed, Execute 0. */
+        response[2]=0;response_len=3;break;
+    case 0x10: /* DAP_SWJ_Pins: report the pins as unavailable. */
+        response[1]=0x80;break;
+    default: break;
+    }
     fault|=uncertain;phase=3;
 }
 static void queue_request(uint32_t now) {
@@ -283,9 +302,26 @@ static void host_poll(uint32_t now) {
     }
     host_discover(now);
     if(phase==1 || phase==2) {
-        if(now-started>=REQUEST_TIMEOUT_MS) {++link_timeouts;fail_request(phase==2);}
-        else if(now-last_tx>=retry_delay(&retry) && radio_send(outgoing)) {
-            last_tx=now;if(retry.attempts) ++link_retries;retry_sent(&retry,now);
+        uint32_t elapsed=now-started;
+        if(elapsed>=REQUEST_TIMEOUT_MS) {++link_timeouts;fail_request(phase==2);}
+        else {
+            /* retry_delay() backs off to 16x the RTO and then clamps at 400 ms,
+             * so a saturated RTO makes the interval flat 400 ms: only four
+             * transmissions (0/400/800/1200) fit inside REQUEST_TIMEOUT_MS and
+             * the last one gets a 300 ms window. Measured per-attempt frame loss
+             * on this link is ~14%, and that is what latched the global fault in
+             * the field. Cap each interval so RETRY_ATTEMPTS_IN_BUDGET more
+             * transmissions still fit the remaining budget: the backoff is a
+             * network congestion control, while this is a single-outstanding
+             * point-to-point ARQ with a hard deadline and a 2-4 ms round trip. */
+            uint32_t remaining=REQUEST_TIMEOUT_MS-elapsed;
+            uint32_t delay=retry_delay(&retry);
+            uint32_t cap=remaining/RETRY_ATTEMPTS_IN_BUDGET;
+            if(!cap) cap=1;
+            if(delay>cap) delay=cap;
+            if(now-last_tx>=delay && radio_send(outgoing)) {
+                last_tx=now;if(retry.attempts) ++link_retries;retry_sent(&retry,now);
+            }
         }
     }
 }

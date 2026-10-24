@@ -45,7 +45,7 @@ python tools/capture_uart.py --port COM13 --dtr --baud 115200 --seconds 30 --out
 - 没有 NRST，不能使用硬件复位或 connect-under-reset。Cortex-M 软件复位依赖目标 MEM-AP 可访问。
 - SWJ 时钟接受 100 kHz–1 MHz 请求值，实际 GPIO 频率仍待标定。默认从 100 kHz 开始。
 
-固件 1.3.1 将正常物理 SWD 操作与额外重试预算分离，正常操作最多 48 次、额外 WAIT/匹配重试最多 32 次。模型验证合法 64 字节报文不会再因旧 32 次预算被截断；真实 WAIT/FAULT 仍可能造成部分完成。HID / Bulk 分别直连已通过下述上板测试；Bulk 与 CDC 并发仍有已复现的故障。
+固件 1.3.1 将正常物理 SWD 操作与额外重试预算分离，正常操作最多 48 次、额外 WAIT/匹配重试最多 32 次。模型验证合法 64 字节报文不会再因旧 32 次预算被截断；真实 WAIT/FAULT 仍可能造成部分完成。HID / Bulk 分别直连已通过下述上板测试。**Bulk 与 CDC 并发的重传预算、超时响应形状已在 1.3.2 修复并上板复测**（见[排查记录](bulk-cdc-investigation.md)）；`SET_INTERFACE` 跨接口复位仍只有原生测试覆盖。
 
 旧 1.3.0 从机可使用保留的 32 字节兼容桥。在一个终端运行：
 
@@ -63,7 +63,7 @@ openocd -f config/openocd-budget.cfg -f target/stm32f1x.cfg -c "cortex_m reset_c
 
 ## 上板验证（2026-10-24）
 
-现场从机的 DAP 固件版本返回 `1.3.1`。测试使用 OpenOCD 0.12.0+dev-02554、STM32F103C8T6 和本仓库 OLED 示例，不使用 32 字节兼容桥。
+现场从机的 DAP 固件版本返回 `1.3.2`（版本字段由**从机**镜像提供，仅刷主机时仍会显示旧版本；旧设备为 `1.3.1`/`1.3.0`，工具按 `1.3.` 前缀兼容）。测试使用 OpenOCD 0.12.0+dev-02554、STM32F103C8T6 和本仓库 OLED 示例，不使用 32 字节兼容桥。
 
 | 测试 | 结果 |
 | --- | --- |
@@ -77,6 +77,8 @@ openocd -f config/openocd-budget.cfg -f target/stm32f1x.cfg -c "cortex_m reset_c
 
 并发失败后，主机故障锁定会连带拒绝后续 DAP 和远端管理，并停止 CDC；远端管理看到的 `81ff` 可能是主机合成的失败响应，不能据此判断从机死机。后一次只拔插主机 USB 即恢复远端通信。建议暂时分开使用调试与无线串口。
 
+**后续排查补充：**三轮原 GDB / Bulk + CDC 并发回放均通过，另完成 DAP Info 和 DP IDCODE 的单独/并发对照。第二轮用新增的 `tools/bulk_cdc_stress.py` 拿到逐事务延迟分布，把根因定量到**重传预算**：`rto` 饱和到上限（单次 ≥134 ms 的首发样本即可）后，`REQUEST_TIMEOUT_MS=1500` 窗口内只剩 4 次发送，而实测每次发送丢帧率约 13.9%；CDC 并发把 p999 从 64 ms 抬到 146 ms，正是把 `rto` 顶到上限的推手。USB 复合层经独立审计确认不存在缓冲重叠、信用被 CDC 抢占或载荷损坏。已修复重传预算、超时后合成响应的命令形状错误、`SET_INTERFACE` 跨接口复位与射频侧静默失败的可观测性；修复尚未烧录验证。实测数据、命令、判别式与边界见 [Bulk + CDC 排查记录](bulk-cdc-investigation.md)。
+
 CDC 初次启用时曾记录 8 B 丢弃和一次硬件 overrun，与启用前 FIFO 积压相符；后续接收未增加队列溢出。此结果不等于持续高吞吐无损验证。验证结束已恢复目标运行；最终 5 秒采集收到 275 B，frames 从 16 增至 40，ready=1、i2c_errors=0、fault=0。
 
 本轮没有烧写 CH570Q、没有擦写 STM32 Flash，也没有复测配置持久化或长时间干扰稳定性；设备版本通过协议读取，未对 CH570Q Flash 做逐字节回读比对。
@@ -85,6 +87,10 @@ CDC 初次启用时曾记录 8 B 丢弃和一次硬件 overrun，与启用前 FI
 
 ## 诊断与测试工具
 
+- `tools/bulk_cdc_stress.py --port COM14`：高交错 Bulk + CDC 压测。逐事务分开记录 `write_ms`（USB NAK 反压）与 `read_ms`（空中延迟），输出延迟分位数，并在任一事务超过 `--outlier-ms` 时立即在同一 Bulk 通道回读固件计数器。`--no-cdc` 做对照，`--dp-idcode` 改用只读 DP 读取。
+- `tools/bulk_cdc_diagnostic.py --port COM14`：Bulk 单独/CDC 并发对照；`--dp-idcode` 增加只读 DP 验证，`--snapshot-only` 仅采集本地 Bulk 故障状态。需要 PyUSB、libusb 后端和 WinUSB 驱动，先关闭 OpenOCD / 其他探针客户端。
+- `tools/induce_timeout.py`：把主机切到另一个信道以制造一次真实 1500 ms 超时，抓取合成响应形状后切回原信道。`APPLY` 会清 `session`，所以超时落在 phase 1、不锁存 `fault`，**无需重新插拔**；可用于验证 `fail_request()` 形状与主机镜像身份。
+- `tools/verify_bulk_cdc_fixes.py --port COM14`：用 `SET_INTERFACE(2)` 前后线路编码与 CDC 字节流是否存活来验证跨接口复位修复。需要能对接口 2 发控制传输的环境（Windows 上 libusb 做不到，因为在 usbser 手里）。
 - `tools/hid_smoke.py --expect-wireless`：USB/DAP 基础验证。
 - `tools/swd_identify.py`：读取目标 DP / MEM-AP 身份。
 - `tools/verify_oled_gdb.py`：OLED 示例的 GDB 自动验证，会复位并控制目标；运行前关闭其他 OpenOCD 实例。

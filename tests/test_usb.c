@@ -1,4 +1,6 @@
-/* Native state-machine tests, not hardware enumeration/timing validation.
+/* Native register/state-machine tests, not hardware enumeration/timing validation.
+ * Events are serialized; the mock does not implement SIE PID checking, DMA
+ * arbitration or W1C. Tests supply TOG_OK and clear flags after each entry.
  * gcc tests/test_usb.c -Itests/usb_mock -Iinclude -std=gnu99 -Wall -Wextra \
  *     -Wno-pointer-to-int-cast -o build/test_usb.exe
  */
@@ -11,7 +13,11 @@ static void event(uint8_t token, uint8_t ep, uint8_t n, uint8_t toggle)
     R8_USB_INT_FG = RB_UIF_TRANSFER;
     R8_USB_INT_ST = token | ep | toggle;
     R8_USB_RX_LEN = n;
-    usb_service();
+#if WD_USB_POLLING
+    usb_dap_poll();
+#else
+    USB_IRQHandler();
+#endif
     R8_USB_INT_FG = 0; /* emulate W1C */
 }
 static uint8_t setup_rx_len = 8;
@@ -42,6 +48,41 @@ static void configure(void)
     setup(0, USB_SET_CONFIGURATION, 1, 0, 0);
     in0();
     assert(usb_dap_configured());
+}
+/* SET_INTERFACE resets only the selected interface's endpoint state. It used to
+ * run the full cdc_reset(), so selecting the ACM control interface (2) threw
+ * away data interface 3's partially received and queued bytes together with the
+ * line coding and DTR, silently killing an open CDC session. */
+static void test_set_interface_isolation(void)
+{
+    uint8_t rx[64];
+    usb_cdc_line_coding_t coding;
+    usb_dap_init();
+    configure();
+    setup(0x21, 0x22, 3, 2, 0); in0(); /* DTR + RTS */
+    assert(usb_cdc_control_line_state() == 3);
+    setup(0x21, 0x20, 0, 2, 7); /* SET_LINE_CODING: data stage follows in DMA */
+    ep0_buffer[0] = 0x80; ep0_buffer[1] = 0x25; /* 9600 baud */
+    ep0_buffer[2] = 0; ep0_buffer[3] = 0;
+    ep0_buffer[4] = 0; ep0_buffer[5] = 0; ep0_buffer[6] = 7; /* 1 stop, none, 7 bits */
+    out0(7); in0();
+    usb_cdc_get_line_coding(&coding);
+    assert(coding.baud_rate == 9600 && coding.data_bits == 7);
+    memset(ep3_buffer, 0x5a, 16);
+    event(UIS_TOKEN_OUT, 3, 16, RB_UIS_TOG_OK);
+    assert(cdc_rx_length == 16 && usb_cdc_write(rx, 4) == 4 && cdc_tx_busy);
+    setup(0x01, USB_SET_INTERFACE, 0, 2, 0); in0(); /* control interface only */
+    assert(usb_cdc_control_line_state() == 3);
+    usb_cdc_get_line_coding(&coding);
+    assert(coding.baud_rate == 9600 && coding.data_bits == 7);
+    assert(cdc_rx_length == 16 && cdc_tx_busy); /* data interface untouched */
+    assert(usb_cdc_read(rx, sizeof(rx)) == 16 && rx[0] == 0x5a);
+    event(UIS_TOKEN_IN, 3, 0, 0);
+    assert(!cdc_tx_busy && usb_cdc_write(rx, 4) == 4);
+    /* Selecting the data interface does reset that interface, as the spec says. */
+    setup(0x01, USB_SET_INTERFACE, 0, 3, 0); in0();
+    assert(!cdc_tx_busy && !cdc_rx_length && !usb_cdc_read(rx, 1));
+    assert(!R8_UEP3_T_LEN && usb_cdc_control_line_state() == 3);
 }
 static void test_composite(void);
 int main(void)
@@ -211,7 +252,12 @@ int main(void)
     assert(usb_dap_take_request(out, &length) && length == 4 && out[0] == 0x5a);
     usb_dap_discard_request();
     test_composite();
-    puts("USB tests passed: HID/Bulk routing and sessions, composite/WinUSB descriptors, CDC control/data/backpressure, reset and lifecycle (IRQ/poll)");
+    test_set_interface_isolation();
+#if WD_USB_POLLING
+    puts("USB polling tests passed: HID/Bulk routing, Bulk+CDC interleaving/ZLP/toggles/backpressure, descriptors and lifecycle");
+#else
+    puts("USB IRQ tests passed: HID/Bulk routing, Bulk+CDC interleaving/ZLP/toggles/backpressure, descriptors and lifecycle");
+#endif
     return 0;
 }
 
@@ -227,6 +273,131 @@ static unsigned control_read(uint8_t *out, unsigned capacity)
     }
     assert(control_state == CTRL_STATUS_OUT);
     out0(0); return total;
+}
+/* Both DAP OUT endpoints must stay closed while CDC progresses independently. */
+static void assert_bulk_processing(uint32_t tag, const uint8_t request[64],
+                                   uint8_t ep1_ctrl, uint8_t ep2_ctrl)
+{
+    assert(request_state == REQ_PROCESSING);
+    assert(generation == tag && transport == USB_DAP_TRANSPORT_BULK);
+    assert(request_length == 17 && !memcmp(request_buffer, request, 64));
+    assert(R8_UEP1_CTRL == ep1_ctrl && R8_UEP2_CTRL == ep2_ctrl);
+    assert((R8_UEP1_CTRL & MASK_UEP_R_RES) == UEP_R_RES_NAK);
+    assert((R8_UEP2_CTRL & MASK_UEP_R_RES) == UEP_R_RES_NAK);
+    assert((R8_UEP2_CTRL & MASK_UEP_T_RES) == UEP_T_RES_NAK);
+}
+static void test_bulk_cdc_interleaved(void)
+{
+    uint8_t request[64] = {0}, taken[64], rx[64], tx[64], desc[256], length;
+    uint8_t ep1_ctrl, ep2_ctrl, ep3_ctrl, ep4_ctrl;
+    uint32_t before = usb_dap_generation(), tag;
+    usb_dap_transport_t route;
+    const uint8_t notification[] = {0xa1, 0x20, 0, 0, 2, 0, 2, 0, 3, 0};
+    assert(request_state == REQ_IDLE && transport == USB_DAP_TRANSPORT_HID);
+    for (unsigned i = 0; i < 64; ++i) {
+        if (i < 17) request[i] = (uint8_t)(0xa0 + i);
+        tx[i] = (uint8_t)(0x80 ^ i);
+        rx[i] = (uint8_t)(0x3f - i);
+    }
+    ep2_ctrl = R8_UEP2_CTRL;
+    memcpy(ep2_buffer, request, 17);
+    event(UIS_TOKEN_OUT, 2, 17, RB_UIS_TOG_OK);
+    assert((R8_UEP2_CTRL & RB_UEP_R_TOG) == ((ep2_ctrl ^ RB_UEP_R_TOG) & RB_UEP_R_TOG));
+    assert(usb_dap_take_request_routed(taken, &length, &tag, &route));
+    assert(route == USB_DAP_TRANSPORT_BULK && tag == before + 1 && length == 17);
+    assert(!memcmp(taken, request, 64));
+    ep1_ctrl = R8_UEP1_CTRL; ep2_ctrl = R8_UEP2_CTRL;
+    assert_bulk_processing(tag, request, ep1_ctrl, ep2_ctrl);
+    /* Synthetic completions under NAK must not advance DAP or its toggles.
+     * Do not overwrite DMA on these events: a real NAK accepts no payload. */
+    out1(64); event(UIS_TOKEN_OUT, 2, 17, RB_UIS_TOG_OK);
+    in1(); event(UIS_TOKEN_IN, 2, 0, 0);
+    assert_bulk_processing(tag, request, ep1_ctrl, ep2_ctrl);
+
+    event(UIS_TOKEN_IN, 4, 0, 0); /* retire initial SERIAL_STATE */
+    assert(!notify_busy);
+    ep4_ctrl = R8_UEP4_CTRL;
+    usb_cdc_set_serial_state(3);
+    assert(R8_UEP4_CTRL == ((ep4_ctrl & RB_UEP_T_TOG) | UEP_R_RES_NAK | UEP_T_RES_ACK));
+    assert(R8_UEP4_T_LEN == sizeof(notification));
+    assert(!memcmp(ep0_buffer + 64, notification, sizeof(notification)));
+    usb_cdc_set_serial_state(1); /* queue a changed state behind this IN */
+    assert(!memcmp(ep0_buffer + 64, notification, sizeof(notification)));
+
+    ep3_ctrl = R8_UEP3_CTRL;
+    memcpy(ep3_buffer, rx, 64);
+    event(UIS_TOKEN_OUT, 3, 64, 0); /* bad PID: no receive or toggle */
+    assert(!cdc_rx_length && R8_UEP3_CTRL == ep3_ctrl);
+    event(UIS_TOKEN_OUT, 3, 64, RB_UIS_TOG_OK);
+    assert(cdc_rx_length == 64 && !cdc_rx_offset);
+    assert((R8_UEP3_CTRL & RB_UEP_R_TOG) == ((ep3_ctrl ^ RB_UEP_R_TOG) & RB_UEP_R_TOG));
+    assert((R8_UEP3_CTRL & MASK_UEP_R_RES) == UEP_R_RES_NAK);
+    assert(usb_cdc_write(tx, 64) == 64 && R8_UEP3_T_LEN == 64);
+    assert(!memcmp(ep3_buffer + 64, tx, 64));
+    ep3_ctrl = R8_UEP3_CTRL;
+    assert(!usb_cdc_write(request, 1));
+    event(UIS_TOKEN_OUT, 3, 64, RB_UIS_TOG_OK); /* RX NAK */
+    assert(R8_UEP3_CTRL == ep3_ctrl && cdc_rx_length == 64);
+    assert(usb_cdc_read(desc, 13) == 13 && !memcmp(desc, rx, 13));
+    assert(cdc_rx_offset == 13 && (R8_UEP3_CTRL & MASK_UEP_R_RES) == UEP_R_RES_NAK);
+    assert_bulk_processing(tag, request, ep1_ctrl, ep2_ctrl);
+
+    /* EP0 and EP4 share an allocation but must not alias notification bytes. */
+    setup(0x80, USB_GET_DESCRIPTOR, 0x0200, 0, 255);
+    assert(control_read(desc, sizeof(desc)) == 130);
+    assert(!memcmp(ep0_buffer + 64, notification, sizeof(notification)));
+    event(UIS_TOKEN_IN, 4, 0, 0);
+    assert((R8_UEP4_CTRL & RB_UEP_T_TOG) == ((ep4_ctrl ^ RB_UEP_T_TOG) & RB_UEP_T_TOG));
+    assert(notify_busy && R8_UEP4_T_LEN == 10 && ep0_buffer[72] == 1 && !ep0_buffer[73]);
+    assert(R8_UEP3_CTRL == ep3_ctrl && !memcmp(ep3_buffer + 64, tx, 64));
+    assert_bulk_processing(tag, request, ep1_ctrl, ep2_ctrl);
+
+    event(UIS_TOKEN_IN, 3, 0, 0); /* 64B ACK queues the terminating ZLP */
+    assert(cdc_tx_busy == 2 && R8_UEP3_T_LEN == 0);
+    assert(R8_UEP3_CTRL == (uint8_t)(ep3_ctrl ^ RB_UEP_T_TOG));
+    assert(!usb_cdc_write(request, 1));
+    assert(usb_cdc_read(desc, sizeof(desc)) == 51 && !memcmp(desc, rx + 13, 51));
+    assert(!cdc_rx_length && !cdc_rx_offset && !usb_cdc_read(desc, 1));
+    assert((R8_UEP3_CTRL & MASK_UEP_R_RES) == UEP_R_RES_ACK);
+    /* Receive another packet while the previous transmit still owes its ZLP. */
+    memcpy(ep3_buffer, rx + 7, 9);
+    ep3_ctrl = R8_UEP3_CTRL;
+    event(UIS_TOKEN_OUT, 3, 9, RB_UIS_TOG_OK);
+    assert((R8_UEP3_CTRL & RB_UEP_R_TOG) == ((ep3_ctrl ^ RB_UEP_R_TOG) & RB_UEP_R_TOG));
+    assert(cdc_tx_busy == 2 && !R8_UEP3_T_LEN && !usb_cdc_write(tx, 1));
+    assert_bulk_processing(tag, request, ep1_ctrl, ep2_ctrl);
+    ep3_ctrl = R8_UEP3_CTRL;
+    event(UIS_TOKEN_IN, 3, 0, 0); /* only this ACK releases TX backpressure */
+    assert(!cdc_tx_busy && !R8_UEP3_T_LEN);
+    assert(R8_UEP3_CTRL == (uint8_t)((ep3_ctrl ^ RB_UEP_T_TOG) | UEP_T_RES_NAK));
+    assert(usb_cdc_read(desc, sizeof(desc)) == 9 && !memcmp(desc, rx + 7, 9));
+    assert(usb_cdc_write(tx + 4, 3) == 3 && R8_UEP3_T_LEN == 3);
+    assert(!memcmp(ep3_buffer + 64, tx + 4, 3));
+    assert_bulk_processing(tag, request, ep1_ctrl, ep2_ctrl);
+
+    assert(!usb_dap_send_response_tagged(request, 17, before));
+    assert(usb_dap_send_response_tagged(request, 17, tag));
+    assert(R8_UEP2_T_LEN == 17 && !memcmp(ep2_buffer + 64, request, 17));
+    assert((R8_UEP2_CTRL & MASK_UEP_T_RES) == UEP_T_RES_ACK);
+    ep2_ctrl = R8_UEP2_CTRL; ep3_ctrl = R8_UEP3_CTRL; ep4_ctrl = R8_UEP4_CTRL;
+    event(UIS_TOKEN_IN, 4, 0, 0);
+    assert(!notify_busy && !R8_UEP4_T_LEN);
+    assert((R8_UEP4_CTRL & RB_UEP_T_TOG) == ((ep4_ctrl ^ RB_UEP_T_TOG) & RB_UEP_T_TOG));
+    event(UIS_TOKEN_IN, 3, 0, 0); /* short packet needs no ZLP */
+    assert(!cdc_tx_busy && !R8_UEP3_T_LEN);
+    assert(R8_UEP3_CTRL == (uint8_t)((ep3_ctrl ^ RB_UEP_T_TOG) | UEP_T_RES_NAK));
+    in1(); out1(64); event(UIS_TOKEN_OUT, 2, 17, RB_UIS_TOG_OK);
+    assert(request_state == REQ_RESPONSE && generation == tag && transport == route);
+    assert(R8_UEP1_CTRL == ep1_ctrl && R8_UEP2_CTRL == ep2_ctrl);
+    assert(!memcmp(request_buffer, request, 64) && !memcmp(ep2_buffer + 64, request, 17));
+    assert(!memcmp(taken, request, 64));
+    event(UIS_TOKEN_IN, 2, 0, 0);
+    assert(request_state == REQ_IDLE && generation == tag && transport == route);
+    assert(!R8_UEP2_T_LEN && (R8_UEP2_CTRL & MASK_UEP_T_RES) == UEP_T_RES_NAK);
+    assert((R8_UEP2_CTRL & RB_UEP_T_TOG) == ((ep2_ctrl ^ RB_UEP_T_TOG) & RB_UEP_T_TOG));
+    assert((R8_UEP2_CTRL & RB_UEP_R_TOG) == (ep2_ctrl & RB_UEP_R_TOG));
+    assert((R8_UEP1_CTRL & MASK_UEP_R_RES) == UEP_R_RES_ACK);
+    assert((R8_UEP2_CTRL & MASK_UEP_R_RES) == UEP_R_RES_ACK);
 }
 static void test_composite(void)
 {
@@ -332,33 +503,7 @@ static void test_composite(void)
     setup(0x21, 0x23, 0xffff, 2, 0); in0(); assert(usb_cdc_break_duration() == 0xffff);
     setup(0xa1, 0x21, 0, 3, 7); assert(control_state == CTRL_STALL);
 
-    /* CDC operates concurrently with a taken DAP command. */
-    out1(64); assert(usb_dap_take_request_tagged(packet, &length, &tag));
-    for (unsigned i = 0; i < 64; ++i) ep3_buffer[i] = (uint8_t)i;
-    event(UIS_TOKEN_OUT, 3, 64, RB_UIS_TOG_OK);
-    assert((R8_UEP3_CTRL & MASK_UEP_R_RES) == UEP_R_RES_NAK);
-    assert(usb_cdc_read(desc, 13) == 13 && desc[12] == 12);
-    assert((R8_UEP3_CTRL & MASK_UEP_R_RES) == UEP_R_RES_NAK);
-    assert(usb_cdc_read(desc, 100) == 51 && desc[0] == 13 && desc[50] == 63);
-    assert((R8_UEP3_CTRL & MASK_UEP_R_RES) == UEP_R_RES_ACK);
-    assert(!usb_cdc_read(desc, 64));
-    assert(usb_cdc_write(packet, 64) == 64 && R8_UEP3_T_LEN == 64);
-    assert(!usb_cdc_write(packet, 1)); event(UIS_TOKEN_IN, 3, 0, 0);
-    assert(cdc_tx_busy == 2 && R8_UEP3_T_LEN == 0); /* terminating ZLP */
-    assert(!usb_cdc_write(packet, 1)); event(UIS_TOKEN_IN, 3, 0, 0);
-    assert(usb_cdc_write(packet, 3) == 3 && R8_UEP3_T_LEN == 3);
-    event(UIS_TOKEN_IN, 3, 0, 0); assert(!cdc_tx_busy);
-    assert(request_state == REQ_PROCESSING && generation == tag);
-    assert(usb_dap_send_response_tagged(packet, 1, tag)); in1();
-    /* Notification DMA cannot be overwritten by EP0 descriptors. */
-    event(UIS_TOKEN_IN, 4, 0, 0);
-    usb_cdc_set_serial_state(3);
-    assert(R8_UEP4_T_LEN == 10 && ep0_buffer[64] == 0xa1 && ep0_buffer[72] == 3);
-    setup(0x80, USB_GET_DESCRIPTOR, 0x0200, 0, 255); control_read(desc, sizeof(desc));
-    assert(ep0_buffer[72] == 3);
-    usb_cdc_set_serial_state(1); assert(ep0_buffer[72] == 3);
-    event(UIS_TOKEN_IN, 4, 0, 0); assert(ep0_buffer[72] == 1 && notify_busy);
-    event(UIS_TOKEN_IN, 4, 0, 0); assert(!notify_busy);
+    test_bulk_cdc_interleaved();
     for (uint8_t ep = 1; ep <= 4; ++ep) {
         setup(0x02, USB_SET_FEATURE, 0, 0x80 | ep, 0); in0();
         setup(0x82, USB_GET_STATUS, 0, 0x80 | ep, 2);

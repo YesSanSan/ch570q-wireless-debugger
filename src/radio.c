@@ -15,9 +15,15 @@ static volatile uint8_t ready, sending;
 volatile uint32_t radio_rx_count, radio_crc_errors, radio_tx_count, radio_drops;
 static volatile uint32_t tx_failures, tx_timeouts, rx_timeouts;
 
+/* A failed re-arm leaves the receiver deaf until something else restarts it, and
+ * the callers cannot recover from an ISR. Count it as an RX-side fault so the
+ * condition is visible in radio_get_stats() instead of silent. */
 static __HIGH_CODE bStatus_t start_rx(void)
 {
-    return paused ? 0 : RFIP_SetRx(&rx);
+    if (paused) return 0;
+    bStatus_t result = RFIP_SetRx(&rx);
+    if (result) ++rx_timeouts;
+    return result;
 }
 
 static __HIGH_CODE void radio_callback(rfRole_States_t state, uint8_t id)
@@ -86,7 +92,12 @@ bool radio_send(const uint8_t frame[RADIO_FRAME_SIZE])
 {
     if (!frame) return false;
     uint32_t irq = __risc_v_disable_irq();
-    if (!initialized || paused || sending) { __risc_v_enable_irq(irq); return false; }
+    /* Distinguish "the radio cannot transmit" from "the frame was sent and
+     * lost". The caller used to get an uncounted false, so a dead TX state
+     * machine was invisible in every counter. A transient still-in-flight
+     * frame is not a fault: the main loop retries it on the next poll. */
+    if (!initialized || paused) { ++tx_failures; __risc_v_enable_irq(irq); return false; }
+    if (sending) { __risc_v_enable_irq(irq); return false; }
     if (RFRole_Stop()) {
         ++tx_failures;
         __risc_v_enable_irq(irq);

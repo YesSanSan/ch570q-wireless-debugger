@@ -1,4 +1,4 @@
-"""Verify OLED using ordinary OpenOCD + CH570Q 1.3.1; --legacy for old firmware."""
+"""Verify OLED using ordinary OpenOCD + CH570Q 1.3.2; --legacy for old firmware."""
 import argparse
 import socket
 import subprocess

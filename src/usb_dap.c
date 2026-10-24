@@ -199,16 +199,30 @@ static void dap_reset(void)
     ++generation;
     ep1_update();
 }
-static void cdc_reset(void)
+/* SET_INTERFACE resets only the endpoint state of the selected interface. The
+ * previous single cdc_reset() let SET_INTERFACE(2) on the ACM control interface
+ * discard data interface 3's partially received and queued bytes together with
+ * the line coding and DTR, killing an already open CDC session. */
+static void cdc_control_reset(void)
+{
+    notify_busy = 0;
+    notified_state = 0xffff; /* send SERIAL_STATE again for the new setting */
+    R8_UEP4_T_LEN = 0;
+}
+static void cdc_data_reset(void)
 {
     cdc_rx_length = cdc_rx_offset = cdc_tx_busy = cdc_tx_length = 0;
-    cdc_control = notify_busy = 0;
+    R8_UEP3_T_LEN = 0;
+}
+static void cdc_reset(void)
+{
+    cdc_data_reset();
+    cdc_control_reset();
+    cdc_control = 0;
     cdc_break = serial_state = 0;
-    notified_state = 0xffff; /* send initial SERIAL_STATE after configuration */
     memset(line_coding, 0, sizeof(line_coding));
     line_coding[0] = 0x00; line_coding[1] = 0xc2; line_coding[2] = 1; /* 115200 */
     line_coding[6] = 8;
-    R8_UEP3_T_LEN = R8_UEP4_T_LEN = 0;
     cdc_update();
 }
 static void new_session(uint8_t config)
@@ -284,9 +298,16 @@ static void ep0_complete(void)
             *ep_ctrl(action_value + 1) = UEP_R_RES_NAK | UEP_T_RES_NAK;
             dap_reset();
         } else {
-            if (action_value == 2) { halt_in &= (uint8_t)~(1u << 4); R8_UEP4_CTRL = UEP_R_RES_NAK | UEP_T_RES_NAK; }
-            else { halt_in &= (uint8_t)~(1u << 3); halt_out &= (uint8_t)~(1u << 3); R8_UEP3_CTRL = UEP_R_RES_NAK | UEP_T_RES_NAK; }
-            cdc_reset();
+            if (action_value == 2) {
+                halt_in &= (uint8_t)~(1u << 4);
+                R8_UEP4_CTRL = UEP_R_RES_NAK | UEP_T_RES_NAK;
+                cdc_control_reset();
+            } else {
+                halt_in &= (uint8_t)~(1u << 3); halt_out &= (uint8_t)~(1u << 3);
+                R8_UEP3_CTRL = UEP_R_RES_NAK | UEP_T_RES_NAK;
+                cdc_data_reset();
+            }
+            cdc_update();
         }
         break;
     case ACT_HALT_IN: halt_in |= 1u << action_value; goto update_endpoints;

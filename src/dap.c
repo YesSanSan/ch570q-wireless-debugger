@@ -39,7 +39,10 @@ static size_t info(uint8_t id,uint8_t *o) {
     const char *s=0; size_t n;
     switch(id) {
     case 1:s="WCH";break; case 2:s="CH570Q Wireless ARM DAP";break;
-    case 3:s="CH570Q-0001";break; case 4:s="1.3.1";break;
+    /* Bump on any behaviour change: the host can read this over DAP_Info without
+     * touching the target, and it is the only reliable way to tell two flashed
+     * images apart (1.3.2 added the Bulk+CDC retry-budget and reply-shape fixes). */
+    case 3:s="CH570Q-0001";break; case 4:s="1.3.2";break;
     case 0xf0:o[1]=1;o[2]=1;return 3; /* SWD only; no SWO/JTAG/timestamp */
     case 0xfe:o[1]=1;o[2]=1;return 3;
     case 0xff:o[1]=2;o[2]=64;o[3]=0;return 4;
