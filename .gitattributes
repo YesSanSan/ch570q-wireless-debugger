@@ -10,3 +10,5 @@
 *.ps1 text eol=lf
 *.md text eol=lf
 *.json text eol=lf
+*.gdb text eol=lf
+.gitattributes text eol=lf

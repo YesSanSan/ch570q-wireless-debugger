@@ -1,6 +1,8 @@
 # Bulk + CDC 并发排查
 
-本文记录两轮排查。第一轮（2026-10-24 上午）确认了失效机制并完成现场对照；第二轮（同日）用新写的交错压测拿到延迟分布，把"首个请求为什么超时"从猜测变成可计算的根因，并修复了四个可证缺陷。
+本文记录三轮排查。第一轮（2026-10-24 上午）确认了失效机制并完成现场对照；第二轮（同日）用新写的交错压测拿到延迟分布，把“首个请求为什么超时”从猜测变成可计算的根因，并修复了四个可证缺陷；第三轮（同日下午至傍晚）换成真 OpenOCD+GDB 跑 flash 擦写、硬件断点与 1 KiB 帧缓冲读取，**复现了现场故障并推翻了“已彻底修好”的结论**。
+
+> **先读这一段：**§1–§5 的根因分析本身成立（重传预算确实把 1500 ms 窗口压到只剩 4 次发送，响应形状确实错），修复也有“改前失败/改后通过”的原生测试钉住，§11 的 120 s 负载三组全绿。但 §12 的真实 GDB 复测表明：**1.3.2 并没有消除现场故障**。持续连续的帧缓冲读取会在 4–24 s 内把主机或从机卡成“一帧不发”的静默状态（`radio_send()` 卡在 `sending`），随后一次 1500 ms 超时就把 `fault` 锁存、会话关闭，只能复位。结论与建议修复见 §12。
 
 ## 结论摘要
 
@@ -9,6 +11,8 @@
 3. **超时之后的合成失败响应格式错误**，`DAP_TransferBlock (0x06)` 会返回 `{0x06, count=0, response=0x00}`，即"成功、传输 0 字"，而 `DAP_SWD_Sequence (0x1d)` 少一个字节。GDB 读帧缓冲走的正是 0x06，这会把它带进假成功/解析错位，比超时本身更容易表现为"主机会话锁死"。
 4. **USB 复合层不背这个锅。** 独立审计核对到 SFR 地址：EP0/EP4 的 128 B 分配、EP1/2/3 各自的 OUT+0/IN+64、`T_LEN`/`CTRL` 字节互不重叠；`request_buffer` 的两个写者分别受 `REQ_IDLE` / `REQ_CONTROL_RX` 门控，CDC 也不占用 DAP 的那一份信用。CDC 的 EP3/EP4 有独立握手机制。
 5. 已修 4 项，其中 3 项有"改前失败、改后通过"的原生测试钉住（见 §5）。剩余缺陷与未证明部分见 §6、§7。
+5. 已修 4 项，其中 3 项有“改前失败、改后通过”的原生测试钉住（见 §5）。剩余缺陷与未证明部分见 §6、§7。
+6. **上述 1–5 是 1.3.2 修复的直接依据，但不足以关闭这个问题。** §12 在真实 GDB 下复现了同一现场故障，并把触发点定位到 `radio_send()` 的静默失败（而不是重传预算）：故障窗口内 `tx` 增量为 0、清 `fault` 后仍死、只能复位；主机与从机两侧都能卡。因此把 §12 当作当前结论，§1–§11 当作已经取得的修复与量化基础。
 
 ## 1. 失效机制（第一轮已确认，仍然成立）
 
@@ -282,7 +286,9 @@ build/host-venv/Scripts/python tools/swd_workload.py --port COM13 --seconds 120
 
 三组都没有一次请求超时、没有锁存、没有一次数据损坏，`drops` 全为 0。CDC 并发把尾部抬高约 30–40 %（p99 67 → 146 ms、p999 224 → 301 ms），但离 1500 ms 截止线仍有 5 倍以上余量。
 
-端到端再跑一次原失效场景（`tools/verify_oled_gdb.py --bulk` 并发 `tools/capture_uart.py`）：GDB 输出 `HARDWARE_VALIDATION_PASS`（软件复位、main/oled_update 硬件断点、单步、RAM 参数修改、暂停恢复、1 KiB 帧缓冲读取），同时 CDC 收到 2826 B，目标 `frames` 0 → 232、`ready=1`、`i2c_errors=0`、`fault=0`。
+端到端再跑一次原失效场景（`tools/verify_oled_gdb.py --bulk` 并发 `tools/capture_uart.py`）：GDB 输出 `HARDWARE_VALIDATION_PASS`（软件复位、main/oled_update 硬件断点、单步、RAM 参数修改、暂停恢复、**单次** 1 KiB 帧缓冲读取），同时 CDC 收到 2826 B，目标 `frames` 0 → 232、`ready=1`、`i2c_errors=0`、`fault=0`。
+
+> 注意：这一轮只读了 **1 个 KiB** 帧缓冲。当天稍后把同样的读连续做 8 次就复现了现场故障，见 §12——本节“全绿”不代表故障已消除。
 
 累计（本次上电复位后）：**28886 次完成、0 次请求超时**、`fault` 从未锁存、`tx_failures` 5 次且全部被重传吸收。设备同时报告 `DAP_Info(4) = "1.3.2"`，确认两块板都是新镜像。
 
@@ -327,11 +333,95 @@ A/B 实测（各 3 轮，脚本见 Git 忽略的 `build/swd-raw-abi.py`）：
 
 `radio_stats_t` 里有 `rx_timeouts`（接收机重挂失败计数），但 `WD_CTL_STATS` 的 12 个字段里没有它，所以"接收机失聪"仍然无法远程确认，只能靠"主机 `tx` 正常增长但 `rx` 不动"间接判断。建议把它加进应答——会改变 `WD_CTL_STATS` 的长度，需同步改工具与文档。
 
-## 12. 相关文件
+## 12. 真实 GDB 场景复测（2026-10-24 16:00–19:50）
+
+§11 的负载是本工具直接发的 DAP 命令。这一轮换回**真 OpenOCD + GDB**，按现场用法跑三件事：目标 Flash 擦写、硬件断点、1 KiB 帧缓冲读取。新增脚本 `examples/ks2-oled/scripts/verify-flash.gdb`，用 `tools/verify_oled_gdb.py --script verify-flash.gdb --timeout 600` 驱动。
+
+### 12.1 Flash 擦写
+
+目标镜像 2728 B（`.isr_vector` 0xec + `.text` 0x9a4 + `.data` 0x18）。
+
+| 路径 | 结果 | 耗时 |
+| --- | --- | --- |
+| `ocd verify_image`（只回读比对） | 通过，2728 B 逐字节一致 | 1.0 s |
+| `ocd flash write_image erase` + `verify_image` | 通过，写入 4.58 s、校验 1.36 s | 10.9 s |
+| GDB `load`（擦除+编程+写后 `reset halt`） | **两次运行一次成功、一次失败** | 27.1 s / 17.2 s |
+
+失败那次的后果是坏的：**Flash 被擦空**（回读全 `0xFF`）、CPU 进 lockup、主机 `fault` 锁存。OpenOCD 侧依次报 `Error connecting DP: cannot read IDR` → `AP write error, reset will not halt` → `DP initialisation failed`，然后 `gdb-flash-write-end` 的 `reset halt` 报错。用 `flash write_image erase` 恢复了现场。
+
+单独隔离测试“编程 + 紧接 `reset halt`”（不经 GDB）**通过**，11.7 s；所以失败不在“写后复位”本身，而在 GDB `load` 这条路径上——它把擦除与编程拆成 `vFlashErase`/`vFlashWrite` 两段并额外触发 `gdb-flash-write-end`。在查清之前，**不要用 GDB `load` 刷这个目标**，用 `openocd ... -c "flash write_image erase <elf>" -c "verify_image <elf>"`。
+
+### 12.2 硬件断点、单步、RAM 参数
+
+两组硬件断点（`hbreak main`、`hbreak oled_update`）均命中，单步 PC 前进，`set var` 改写 RAM 参数即时生效、暂停后 `g_frame_count` 不再推进。这部分两轮都通过。
+
+### 12.3 1 KiB 帧缓冲读取：连读 8 次复现现场故障
+
+单次 1 KiB（`dump binary memory ... g_oled_buffer+1024`）多次通过；**连续 8 次（8 KiB）直接复现了现场记录里的那个失败**：
+
+```
+FRAMEBUFFER dumps=8 bytes=8192
+Cannot access memory at address 0x20000008        # g_frame_delay_ms
+```
+
+OpenOCD 日志在这个位置开始连续刷 `CMSIS-DAP Protocol Error @ 0 (wrong parity)`。**这些不是奇偶错**：主机一旦锁存 `fault`，`fail_request()` 就把每个请求合成成 `06 00 08` / `05 00 08`，OpenOCD 把状态字节 8 读作协议错误，于是一条真错被放大成一片假奇偶错。排查时不要被这个信号带偏。
+
+### 12.4 定位：不是重传预算，是射频静默卡死
+
+三条互相独立的判据，实测四项全部指向同一个结论：
+
+| 观测 | 空口丢包（重传预算） | 静默卡死 |
+| --- | --- | --- |
+| 失败窗口内 `tx` 增量 | 上百次重传 | **0** |
+| 清掉 `fault`（HID 换代）后重试 | 立即恢复 | **仍 1.500 s 超时，`tx` 增量仍为 0** |
+| 恢复手段 | 无需干预 | **只能复位** |
+
+`radio_send()` 里只有一条不计数就返回 `false` 的路径：`if (sending) { return false; }`（`src/radio.c`）——`sending` 置位后若 TX 完成中断没来，就永远不会清。主机侧卡住表现为一帧不发；从机侧卡住更严重：`slave_poll()` 开头是 `if(pending_response) { if(radio_send(outgoing)) pending_response=false; return; }`，一次发送失败就把整个从机主循环锁死，连 `HELLO` 都不再应答（实测：主机 `tx` 正常增长、`rx` 恒为 0、`crc_errors` 不动）。
+
+作为对照，今天一个 30 s 的正常 cycle 跑里出现过 555 ms / 662 ms(p999) / 880 ms(max) 的慢请求，其窗口 `tx` 速率是 **32–72 次/秒**——健康但慢的请求与静默卡死在 `tx` 速率上差两个数量级，这也是新加的 `tx_per_second` 判据的依据。
+
+### 12.5 请求密度与故障时间
+
+| 负载 | 请求密度 | 首次超时 |
+| --- | --- | --- |
+| cycle 模式，100 kHz / 1 MHz，各 120 s | 约 30 次/秒，混有多种命令 | 未发生（3 组全绿） |
+| OpenOCD + GDB 连续帧缓冲读（1 MHz） | 约 27 次/秒 | 24 s |
+| `--mode fb` 纯背靠背块读（100 kHz） | 约 19–21 次/秒 | **4 s（第 4 个 KiB）** |
+
+不是单调的“越快越容易”：`fb` 模式密度更低却更快翻车，差别在于它**没有任何间隙、也不夹杂其他命令**。竞争条件看起来与“连续同类型请求”相关，而不是纯吞吐。同一轮里 30 s cycle 跑虽然全绿，但 max 已到 880 ms，离 1500 ms 截止线只剩 1.7 倍。
+
+### 12.6 新增工具能力
+
+- `--mode fb`：每周期 17 次 60 B 块读，正好一个 1 KiB 帧缓冲，对应 GDB 的 `dump binary memory`。
+- `--stop-on-error`：遇到第一个非 OK 应答立即停下并快照计数器，不再靠重同步把现场掩盖掉（之前的版本会把失败重试掉，只留结果）。
+- 离群记录新增 `window_ms` / `window_exchanges` / `tx_per_second`，用来区分“慢但健康”与“静默”。
+- `fb` 模式第一笔必须先发一次 DP IDCODE：实测这块目标在换线复位后的第一条 AP 访问不被应答（`05 00 08`），先做一次 DP 读就正常。
+
+复现命令：
+
+```powershell
+build/host-venv/Scripts/python tools/swd_workload.py --mode fb --seconds 120 --stop-on-error
+```
+
+### 12.7 建议修复（均未实施）
+
+1. **`radio_send()` 的发送看护**：`sending` 置位后超过 N ms（建议 100 ms）仍未收到 TX 完成或超时中断，就按发送失败处理：清 `sending`、`start_rx()`、`++tx_timeouts`。这一条同时治主机与从机两侧的静默。
+2. **从机 `pending_response` 门控加超时**：超时后清 `pending_response` 并把失败当作未知应答，继续服务链路。否则一次发送失败就是永久静音。
+3. **`Fault` 与超时的耦合需要重新审视**：任何一次 1500 ms 超时都会锁存 `fault` 并关闭会话，而上面两个缺陷都能造出这种超时。在 1、2 修好之前，`fault` 锁存实际上是“缺陷放大器”。
+4. **`rx_timeouts` 仍不可读**：接收机重挂失败计数在 `radio_stats_t` 里，但没进 `WD_CTL_STATS`，从机失聪只能靠“主机 `tx` 涨、`rx` 不动”间接判断。
+
+### 12.8 验证边界
+
+- Flash 擦写走 `flash write_image erase` 可用；GDB `load` 未通过，不要用。
+- 1 KiB 帧缓冲单次读可用；连续多 KiB 会在 4–24 s 内卡死，卡死后整机静默，只能复位。
+- 本轮所有结论都基于固件 **1.3.2**（`DAP_Info(4)` 实测 `31 2e 33 2e 32`），即已包含重传预算与响应形状修复；也就是说**这两项修复不足以消除现场故障**。
+
+## 13. 相关文件
 
 - `docs/findings-link.md`：主机调度器 + RF 链路审计（RTO 饱和的算术推导、各机制事件轨迹与 `WD_CTL_STATS` 指纹表、F1–F7 建议、T1–T7 测试设计）。
 - `docs/findings-usb.md`：USB 复合层审计（SFR 级缓冲核对、`request_state` 闭包与活性、C1–C6 缺陷、mock 能力边界）。
 - `tools/bulk_cdc_stress.py`：交错压测工具（逐事务计时 + 离群时抓计数器）。
 - `tools/induce_timeout.py`：可逆地制造一次真实 1500 ms 超时，抓取合成响应形状。
 - `tools/verify_bulk_cdc_fixes.py`：`SET_INTERFACE` 隔离与 CDC 存活的线上验证（需能对接口 2 发控制传输的具体环境）。
-- `tools/swd_workload.py`：真实 SWD 负载压测（多事务 `DAP_Transfer`、15 字块读写、`DAP_SWD_Sequence`、halt/寄存器/死栈往返），逐事务计时、逐步校验 ACK、离群时回读计数器，可选并发 CDC。
+- `tools/swd_workload.py`：真实 SWD 负载压测（多事务 `DAP_Transfer`、15 字块读写、`DAP_SWD_Sequence`、halt/寄存器/死栈往返），逐事务计时、逐步校验 ACK、离群时回读计数器，可选并发 CDC；`--mode fb` 复现连续帧缓冲读故障，`--stop-on-error` 保留首次失败现场。
+- `examples/ks2-oled/scripts/verify-flash.gdb`：GDB 全流程脚本（flash 擦写 + 回读比对 + 硬件断点 + 单步 + 8x1 KiB 帧缓冲读），用 `tools/verify_oled_gdb.py --script verify-flash.gdb` 驱动。

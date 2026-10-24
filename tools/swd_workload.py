@@ -198,6 +198,14 @@ def main():
                         help='Exchanges between routine counter snapshots; 0 disables')
     parser.add_argument('--cdc-write-rate', type=float, default=0.0,
                         help='Bytes per second pushed into the target UART (default: receive only)')
+    parser.add_argument('--mode', choices=('cycle', 'fb'), default='cycle',
+                        help='cycle: mixed debugger burst; fb: 17 back-to-back block reads, '
+                             'one 1 KiB frame buffer per cycle, like dump binary memory')
+    parser.add_argument('--address', type=lambda text: int(text, 0), default=0x20000048,
+                        help='First address read in --mode fb')
+    parser.add_argument('--stop-on-error', action='store_true',
+                        help='Stop at the first non-OK SWD reply instead of resyncing, so '
+                             'the failing request keeps its own evidence')
     parser.add_argument('--output', type=Path, default=Path('build/swd-workload.json'))
     args = parser.parse_args()
     if args.seconds <= 0:
@@ -256,11 +264,24 @@ def main():
         probe.exchange('resync_idcode', transfer((DP_IDCODE, None)))
 
     def step(name, request):
-        """One SWD request; a missing ACK triggers one resync and one retry."""
+        """One SWD request; a missing ACK is recorded, then one resync and retry."""
         write_ms, read_ms, reply = probe.exchange(name, request)
         if not swd_ok(request, reply):
+            probe.recent.append({'step': name, 'phase': 'first',
+                                 'reply': bytes(reply).hex(),
+                                 'status': swd_status(request, reply),
+                                 'elapsed_ms': round(write_ms + read_ms, 2)})
+            if args.stop_on_error:
+                failed.append(name)
+                return write_ms, read_ms, reply
             resync(name)
             write_ms, read_ms, reply = probe.exchange(name, request)
+            if not swd_ok(request, reply):
+                failed.append(name)
+                probe.recent.append({'step': name, 'phase': 'retry',
+                                     'reply': bytes(reply).hex(),
+                                     'status': swd_status(request, reply),
+                                     'elapsed_ms': round(write_ms + read_ms, 2)})
         return write_ms, read_ms, reply
 
     def check(name, ok, detail):
@@ -323,6 +344,7 @@ def main():
                 return
 
     flash_reference = None
+    failed = []
     cycles = 0
     exchanges = 0
     last_counters = {}
@@ -391,6 +413,39 @@ def main():
         probe.exchange('swd_sequence_idle', swj_sequence(8, b'\x00'))
         exchanges += 2
         return write_ms + read_ms
+
+    def run_fb_cycle(index):
+        """Seventeen back-to-back 60-byte block reads: one 1 KiB frame buffer.
+
+        This is the load a GDB `dump binary memory ... +1024` produces, with no
+        idle time between requests, and it is the load that reproduced the field
+        failure. Returns the worst single-request latency in the cycle.
+        """
+        nonlocal exchanges
+        # Measured on this target: an AP write issued as the very first SWD
+        # transaction after a line reset is not acknowledged, so open the run with
+        # a DP read rather than the bank-select write.
+        write_ms, read_ms, reply = step('fb_idcode', transfer((DP_IDCODE, None)))
+        exchanges += 1
+        worst = write_ms + read_ms
+        check('fb_idcode', len(reply) >= 7 and reply[2] == SWD_ACK_OK
+              and u32(reply, 3) == IDCODE_CM3,
+              {'index': index, 'reply': reply.hex()})
+        write_ms, read_ms, _ = step('fb_setup', transfer((DP_SELECT, 0),
+                                                        (AP_CSW_W, CSW_MEM),
+                                                        (AP_TAR_W, args.address)))
+        worst = max(worst, write_ms + read_ms)
+        exchanges += 1
+        good = 0
+        for _ in range(17):
+            write_ms, read_ms, reply = step('fb_read', block_read(BLOCK_WORDS))
+            exchanges += 1
+            worst = max(worst, write_ms + read_ms)
+            if (len(reply) == 4 + 4 * BLOCK_WORDS and reply[1] == BLOCK_WORDS
+                    and reply[3] == SWD_ACK_OK):
+                good += 1
+        check('fb_blocks', good == 17, {'index': index, 'good': good})
+        return worst
 
     def read_core_register(regsel, index):
         step('dcrsr', transfer((AP_TAR_W, DCRSR), (AP_DRW_W, regsel)))
@@ -484,6 +539,8 @@ def main():
         probe.exchange('config_idle', swj_sequence(8, b'\x00'))
         result['before'] = read_counters()
         last_counters = dict(result['before']['stats'])
+        probe_at = time.monotonic()
+        probe_exchanges = 0
         if result['before']['info']['fault_locked']:
             raise RuntimeError('Firmware fault already latched; refuse to load the target')
 
@@ -502,8 +559,17 @@ def main():
 
         deadline = time.monotonic() + args.seconds
         while time.monotonic() < deadline:
-            total_ms = run_cycle(cycles)
+            total_ms = run_fb_cycle(cycles) if args.mode == 'fb' else run_cycle(cycles)
             cycles += 1
+            if failed:
+                # Keep the state that produced the first bad reply: the counters
+                # next to it are what separate a slow request from a silent radio.
+                result['failed_at'] = {'cycle': cycles, 'step': failed[0]}
+                try:
+                    result['failed_at']['counters'] = read_counters()
+                except BaseException as snapshot_error:
+                    result['failed_at']['snapshot_error'] = str(snapshot_error)
+                break
             if args.debug_every and cycles % args.debug_every == 0:
                 run_intrusive(cycles)
             if total_ms >= args.outlier_ms or (args.probe_every
@@ -511,12 +577,24 @@ def main():
                 snapshot = read_counters()['stats']
                 delta = {k: snapshot[k] - last_counters.get(k, 0) for k in STATS}
                 last_counters = snapshot
+                now = time.monotonic()
+                window_ms = (now - probe_at) * 1000.0
+                window_calls = exchanges - probe_exchanges
+                probe_at, probe_exchanges = now, exchanges
+                rate = round(delta['tx'] / (window_ms / 1000.0), 1) if window_ms else None
                 if total_ms >= args.outlier_ms:
+                    # tx/s tells a slow-but-healthy exchange (hundreds of
+                    # retransmissions per second) from a silent radio (near
+                    # zero): the latter is radio_send() failing without a
+                    # counter on one of the two boards.
                     outliers.append({'cycle': cycles, 'total_ms': round(total_ms, 2),
-                                     'unix': time.time(), 'delta': delta})
-
-        probe.exchange('config_disconnect', bytes((0x03,)))
-        result['after'] = read_counters()
+                                     'unix': time.time(), 'delta': delta,
+                                     'window_ms': round(window_ms, 1),
+                                     'window_exchanges': window_calls,
+                                     'tx_per_second': rate})
+        if not failed:
+            probe.exchange('config_disconnect', bytes((0x03,)))
+            result['after'] = read_counters()
     except BaseException as error:
         result['error'] = str(error)
         result['exc_type'] = type(error).__name__
@@ -547,6 +625,7 @@ def main():
         result['outliers'] = outliers[-40:]
         result['recent_transactions'] = list(probe.recent)
         result['cycles'] = cycles
+        result['failed_steps'] = failed[-40:]
         result['resync_count'] = len(result['resyncs'])
         result['resyncs'] = result['resyncs'][-40:]
         result['exchanges'] = exchanges
@@ -583,12 +662,14 @@ def main():
                            for key in STATS}
         failures = sum(entry['fails'] for entry in result['functional_checks'].values())
         result['functional_failures_total'] = failures
-        result['passed'] = (failures == 0
+        result['passed'] = (failures == 0 and not failed
                             and result.get('fault_latched') is False
                             and result['delta'].get('request_timeouts') == 0
                             and 'error' not in result
                             and not result.get('final_error')
                             and (not args.port or cdc['bytes'] > 0))
+        if failed:
+            result['passed'] = False
 
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
@@ -599,6 +680,8 @@ def main():
     checks = {name: f"{entry['passes']}/{entry['passes'] + entry['fails']}"
               for name, entry in result['functional_checks'].items()}
     print('functional checks: ' + json.dumps(checks, indent=2))
+    if result.get('failed_at'):
+        print('first failure: ' + json.dumps(result['failed_at'], indent=2))
     return 0 if result['passed'] else 1
 
 

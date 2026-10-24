@@ -9,6 +9,9 @@ from pathlib import Path
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--legacy', action='store_true', help='Use 32-byte TCP bridge for firmware 1.3.0')
 parser.add_argument('--bulk', action='store_true', help='Test ordinary OpenOCD USB Bulk instead of HID')
+parser.add_argument('--script', default='verify.gdb',
+                    help='GDB script under examples/ks2-oled/scripts (verify-flash.gdb writes target flash)')
+parser.add_argument('--timeout', type=float, default=45.0, help='GDB batch timeout in seconds')
 args = parser.parse_args()
 if args.legacy and args.bulk:
     parser.error('--legacy and --bulk are mutually exclusive')
@@ -37,9 +40,9 @@ with log.open('w', encoding='utf-8') as console:
                     raise TimeoutError('OpenOCD not ready')
                 time.sleep(.1)
         result = subprocess.run(['arm-none-eabi-gdb', '-q', '-batch', '-x',
-                                 str(example / 'scripts/verify.gdb')], cwd=root,
+                                 str(example / 'scripts' / args.script)], cwd=root,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                timeout=45)
+                                timeout=args.timeout)
         output = result.stdout.decode('utf-8', errors='replace')
         (example / 'build/gdb-validation.log').write_text(output, encoding='utf-8')
         print(output)
