@@ -18,6 +18,8 @@
 
 **真实 SWD 与 GDB 复测（2026-10-24）：**`tools/swd_workload.py` 的三组 120 s 负载（Bulk 单独、Bulk+CDC @100 kHz、Bulk+CDC @1 MHz）全绿：约 2.9 万次 DAP 事务、0 次请求超时、无 `fault` 锁存、无数据损坏（flash 块读逐次逐位比对、RAM 写入-回读-恢复逐字节一致）。但**真 OpenOCD+GDB 复测未能保持这个结论**：硬件断点、单步、单次 1 KiB 帧缓冲读通过，`flash write_image erase` + `verify_image` 通过（2728 B，10.9 s），但 **GDB `load` 两次运行一次失败**（失败时目标 Flash 被擦空、CPU lockup），且**连续 8x1 KiB 帧缓冲读在 4–24 s 内复现了现场故障**（GDB 在帧缓冲读后的参数写入处报 `Cannot access memory`）。定位：**不是重传预算**，而是 `radio_send()` 卡在 `sending` 导致的**射频静默**——失败窗口内 `tx` 增量为 0、清 `fault` 后仍死、只能复位，主机与从机两侧都能卡；另发现 `DAP_SWD_Sequence` 读序列后必须由主机补一条线复位，否则目标停止应答。**所以 1.3.2 的重传预算与响应形状修复不足以消除现场故障**，需按[§12.7](docs/bulk-cdc-investigation.md)补发送看护。详见[并发排查记录 §11–§12](docs/bulk-cdc-investigation.md)。
 
+**与商用无线调试器的对照（2026-10-24）：**用一台 WCH-LinkW（`1a86:8012`，固件 `2.0.0`）在**同一块板、同一份 ELF、同一套工具**上重跑上述负载。结果把问题定到了实现而非品类：连续 8x1 KiB 帧缓冲读那个打死 CH570Q 的序列，WCH-LinkW **5/5 通过、单轮 3.2 s**；`--mode cycle` 吞吐是 CH570Q 的 3–5 倍（23–29 cycle/s 对 8.3）、p99 低一个数量级（10–20 ms 对 67 ms）；`program`+`verify` 烧录 15/15 全过。同时它也暴露了自己的弱点：在工具能压到的最高事务率下，16 轮里有 5 轮出现一次**请求完全不返回**的 5 秒停顿——**但它会自愈，不需要拔插复位**，而 CH570Q 一旦卡住在 `radio_send()` 就是永久静默。所以本项目的下一步不是追速度，而是让一次失败变成可重试的失败。数据与边界见[并发排查记录 §13](docs/bulk-cdc-investigation.md)。
+
 ## 硬件连接
 
 | 引脚 | 主机 | 从机 |

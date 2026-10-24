@@ -56,6 +56,8 @@ python tools/capture_uart.py --port COM13 --dtr --baud 115200 --seconds 30 --out
 
 **同日的真实 GDB 复测推翻了“已彻底修好”的结论：**真 OpenOCD+GDB 跑 Flash 擦写、硬件断点、8x1 KiB 帧缓冲连读时，**连读 8 个 KiB 即复现了现场故障**（GDB 在帧缓冲读后的参数写入处报 `Cannot access memory`）。定位结果：不是重传预算耗尽，而是 `radio_send()` 的 `sending` 卡死导致的**射频静默**——失败窗口内 `tx` 增量为 0，清 `fault` 后仍死，只能复位；主机与从机两侧都能卡。硬件断点与单步两轮均通过；Flash 擦写走 OpenOCD 命令可用，GDB `load` 未通过。详见[排查记录 §12](bulk-cdc-investigation.md)。
 
+**同日与 WCH-LinkW 的对照：**同一块板、同一份 `build/ks2.elf`、同一套工具，只换探头。同一个 8x1 KiB 帧缓冲读序列，WCH-LinkW **5/5 通过、单轮 3.1–3.4 s**；`program`+`verify` 烧录 15/15（1000 kHz 中位 14.45 s，100 kHz 15.28 s）；`--mode cycle` 为 23–29 cycle/s、p99 10–20 ms，是 CH570Q 的 3–5 倍。它自己的弱点是最高事务率下 16 轮中 5 轮出现一次 5 s 无应答，**但能自愈，不需要拔插复位**。结论：帧缓冲连读卡死是 CH570Q 的实现缺陷，不是无线调试器的共性。数据见[排查记录 §13](bulk-cdc-investigation.md)。
+
 旧 1.3.0 从机可使用保留的 32 字节兼容桥。在一个终端运行：
 
 ```powershell
@@ -102,7 +104,10 @@ CDC 初次启用时曾记录 8 B 丢弃和一次硬件 overrun，与启用前 FI
 - `tools/verify_bulk_cdc_fixes.py --port COM14`：用 `SET_INTERFACE(2)` 前后线路编码与 CDC 字节流是否存活来验证跨接口复位修复。需要能对接口 2 发控制传输的环境（Windows 上 libusb 做不到，因为在 usbser 手里）。
 - `tools/hid_smoke.py --expect-wireless`：USB/DAP 基础验证。
 - `tools/swd_identify.py`：读取目标 DP / MEM-AP 身份。
-- `tools/swd_workload.py [--mode cycle|fb] [--port COM13] [--seconds 120] [--speed 100000] [--stop-on-error]`：真实 SWD 负载压测。`cycle` 模式每周期发多事务 `DAP_Transfer`、15 字 flash 块读（满 64 字节包）与 `DAP_SWD_Sequence` 原始捕获，每 `--debug-every` 周期做一次 halt / 读 DHCSR 与 SP、PC / 死栈区块读写往返 / resume；`fb` 模式每周期连读 17 次 60 B（正好一个 1 KiB 帧缓冲，对应 GDB 的 `dump binary memory`），用于复现连续帧缓冲读卡死。每一步都校验 SWD ACK 与数据内容，并逐事务计时、离群时回读计数器并给出 `tx_per_second` 判据。`--stop-on-error` 在第一个非 OK 应答处停下并快照现场。先关闭 OpenOCD。
+- `tools/swd_workload.py [--mode cycle|fb] [--port COM13] [--seconds 120] [--speed 100000] [--stop-on-error] [--vid 0x1209 --pid 0x0001]`：真实 SWD 负载压测。`cycle` 模式每周期发多事务 `DAP_Transfer`、15 字 flash 块读（满 64 字节包）与 `DAP_SWD_Sequence` 原始捕获，每 `--debug-every` 周期做一次 halt / 读 DHCSR 与 SP、PC / 死栈区块读写往返 / resume；`fb` 模式每周期连读 17 次 60 B（正好一个 1 KiB 帧缓冲，对应 GDB 的 `dump binary memory`），用于复现连续帧缓冲读卡死。每一步都校验 SWD ACK 与数据内容，并逐事务计时、离群时回读计数器并给出 `tx_per_second` 判据。`--stop-on-error` 在第一个非 OK 应答处停下并快照现场。先关闭 OpenOCD。
+  `--vid/--pid/--serial/--interface` 可指向任意 CMSIS-DAP v2 探头（Bulk 端点自动识别，不再写死 `0x02`/`0x82`）；`--no-local-stats` 关掉 CH570Q 专有的 `0x80` 计数器——外来探头（如 WCH-LinkW）没有这些计数器，工具会自动降级，只失去计数器、不失去延迟与功能测量。
+- `tools/flash_compare.py --probe linkw|wireless [--attempts 10]`：两探头、同一条 OpenOCD 烧录命令（与 `scripts/upload.ps1` 完全一致，含默认 `adapter speed`）的逐次基准。它**不内部重试**，只统计首烧失败率与耗时分布，所以能直接回答“第一次烧录到底会不会失败”。逐次日志与 `summary.json` 落在 `build/flash-compare/`。
+- `tools/gdb_dump_stress.py --probe linkw|ch570q [--passes 5] [--dumps 8] [--size 1024]`：OpenOCD + GDB 连续 1 KiB `dump binary memory` 压力，即[§12.3](bulk-cdc-investigation.md) 那条打死 CH570Q 的命令行；换 `--probe` 就能对两个探头跑同一个脚本。证据（生成的 GDB 脚本、每轮 GDB 日志、`summary.json`）落在 `build/gdb-dump-stress/`。
 - `tools/verify_oled_gdb.py [--bulk] [--script verify.gdb] [--timeout 600]`：OLED 示例的 GDB 自动验证，会复位并控制目标；运行前关闭其他 OpenOCD 实例。`--script verify-flash.gdb` 跑 Flash 擦写 + 回读比对 + 硬件断点 + 8x1 KiB 帧缓冲读，但其中的 GDB `load` 与连续帧缓冲读目前会卡死会话，见[§12](bulk-cdc-investigation.md)。
 - `examples/ks2-oled/scripts/render_buffer.py`：将 1024 B OLED 页式缓冲转为 PNG。
 

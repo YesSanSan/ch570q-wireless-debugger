@@ -147,8 +147,9 @@ def swd_ok(request, reply):
 
 
 class Probe:
-    def __init__(self, dev):
+    def __init__(self, dev, ep_out=OUT_IN, ep_in=OUT_OUT):
         self.dev = dev
+        self.ep_out, self.ep_in = ep_out, ep_in
         self.latency = defaultdict(list)
         self.recent = deque(maxlen=48)
 
@@ -156,13 +157,14 @@ class Probe:
         """Return (write_ms, read_ms, reply) and time the two halves separately."""
         entry = {'step': name, 'request': request.hex()}
         begin = time.perf_counter()
+        mark = None
         try:
-            written = self.dev.write(OUT_IN, request, timeout=5000)
+            written = self.dev.write(self.ep_out, request, timeout=5000)
             mark = time.perf_counter()
             if written != len(request):
                 raise ExchangeError(
                     f'{name}: short Bulk OUT ({written}/{len(request)})')
-            reply = bytes(self.dev.read(OUT_OUT, 64, timeout=5000))
+            reply = bytes(self.dev.read(self.ep_in, 64, timeout=5000))
             end = time.perf_counter()
             entry['reply'] = reply.hex()
             if not reply:
@@ -176,12 +178,51 @@ class Probe:
         except BaseException as error:
             entry['error'] = str(error)
             entry['elapsed_ms'] = round((time.perf_counter() - begin) * 1000.0, 2)
+            # A stall with write_ms present is the probe refusing to answer; a
+            # stall without it is the probe back-pressuring the Bulk OUT.
+            if mark is not None:
+                entry['write_ms'] = round((mark - begin) * 1000.0, 2)
             if record:
                 self.recent.append(entry)
             raise
         finally:
             if record:
                 entry['elapsed_ms'] = round((time.perf_counter() - begin) * 1000.0, 2)
+
+
+BULK = 0x02
+DEFAULT_VID, DEFAULT_PID = 0x1209, 0x0001
+
+
+def find_probe(args):
+    """Locate the probe and the bulk endpoint pair of its CMSIS-DAP v2 interface.
+
+    The CH570Q puts interface 1 (vendor class) on 0x02/0x82. The WCH-LinkW puts
+    its v2 interface at interface 0 on 0x02/0x83. Hardcoding either number makes
+    the workload unrunnable on the other probe, so prefer a vendor-class
+    interface with exactly one bulk IN and one bulk OUT and fall back to the
+    documented CMSIS-DAP v2 interface number.
+    """
+    devices = list(usb.core.find(find_all=True, idVendor=args.vid, idProduct=args.pid))
+    if args.serial:
+        devices = [dev for dev in devices if (dev.serial_number or '') == args.serial]
+    if len(devices) != 1:
+        raise RuntimeError(
+            f'Expected one probe at {args.vid:#06x}:{args.pid:#06x}, found {len(devices)}')
+    dev = devices[0]
+    if args.interface is not None:
+        candidates = [intf for intf in dev[0] if intf.bInterfaceNumber == args.interface]
+    else:
+        candidates = [intf for intf in dev[0] if intf.bInterfaceClass == 0xff]
+        candidates += [intf for intf in dev[0] if intf.bInterfaceNumber == 1]
+    for intf in candidates:
+        endpoints = [ep.bEndpointAddress for ep in intf
+                     if (ep.bmAttributes & 0x03) == BULK]
+        outs = [addr for addr in endpoints if not addr & 0x80]
+        ins = [addr for addr in endpoints if addr & 0x80]
+        if len(outs) == 1 and len(ins) == 1:
+            return dev, ins[0], outs[0], intf.bInterfaceNumber
+    raise RuntimeError('No CMSIS-DAP v2 bulk interface on this probe')
 
 
 def main():
@@ -206,8 +247,18 @@ def main():
     parser.add_argument('--stop-on-error', action='store_true',
                         help='Stop at the first non-OK SWD reply instead of resyncing, so '
                              'the failing request keeps its own evidence')
+    parser.add_argument('--vid', type=lambda text: int(text, 0), default=DEFAULT_VID,
+                        help='Probe USB vendor id (default 0x1209, the CH570Q)')
+    parser.add_argument('--pid', type=lambda text: int(text, 0), default=DEFAULT_PID,
+                        help='Probe USB product id (default 0x0001, the CH570Q)')
+    parser.add_argument('--serial', help='Only use the probe with this USB serial number')
+    parser.add_argument('--interface', type=int, default=None,
+                        help='Bulk interface number; default: the vendor-class interface')
+    parser.add_argument('--no-local-stats', action='store_true',
+                        help='Skip the CH570Q vendor counters; foreign probes have none')
     parser.add_argument('--output', type=Path, default=Path('build/swd-workload.json'))
     args = parser.parse_args()
+    started = time.monotonic()
     if args.seconds <= 0:
         parser.error('--seconds must be positive')
     if args.speed <= 0:
@@ -215,10 +266,7 @@ def main():
     if args.debug_every < 0:
         parser.error('--debug-every must be zero or positive')
 
-    devices = list(usb.core.find(find_all=True, idVendor=0x1209, idProduct=0x0001))
-    if len(devices) != 1:
-        raise RuntimeError(f'Expected one probe, found {len(devices)}')
-    dev = devices[0]
+    dev, ep_in, ep_out, interface = find_probe(args)
 
     result = {
         'time': datetime.now().astimezone().isoformat(),
@@ -231,9 +279,33 @@ def main():
         'functional_checks': {},
         'functional_failures': [],
     }
-    probe = Probe(dev)
+    probe = Probe(dev, ep_out, ep_in)
+    result['probe'] = {'vid': f'{args.vid:#06x}', 'pid': f'{args.pid:#06x}',
+                       'interface': interface,
+                       'ep_out': f'{ep_out:#04x}', 'ep_in': f'{ep_in:#04x}'}
+    try:
+        result['probe']['serial'] = dev.serial_number
+    except BaseException:
+        pass
+    stats_ok = [not args.no_local_stats]
+
     def read_counters():
-        """Local diagnostics over the same Bulk channel; never disturbs the link."""
+        """CH570Q-only vendor diagnostics; None when the probe has no such command.
+
+        The WCH-LinkW answers 0x80 with a single 0xff error byte, so a foreign
+        probe loses the counters while the workload itself still runs and is
+        measured; the silence that matters is visible in the latency table.
+        """
+        if not stats_ok[0]:
+            return None
+        try:
+            return _read_counters()
+        except BaseException:
+            stats_ok[0] = False
+            result['local_stats'] = 'unavailable'
+            return None
+
+    def _read_counters():
         snapshot = {}
         for sub, name in ((0, 'info'), (1, 'stats')):
             _, _, reply = probe.exchange('local', bytes((0x80, sub)), record=False)
@@ -526,7 +598,7 @@ def main():
         exchanges += 3
 
     try:
-        usb.util.claim_interface(dev, 1)
+        usb.util.claim_interface(dev, interface)
         # Configuration the way a debugger leaves it: SWD only, no idle cycles,
         # bounded WAIT retries, then line reset and the JTAG-to-SWD switch.
         probe.exchange('config_connect', bytes((0x02, 1)))
@@ -538,10 +610,10 @@ def main():
         probe.exchange('config_line_reset2', swj_sequence(64, b'\xff' * 8))
         probe.exchange('config_idle', swj_sequence(8, b'\x00'))
         result['before'] = read_counters()
-        last_counters = dict(result['before']['stats'])
+        last_counters = dict((result['before'] or {}).get('stats') or {})
         probe_at = time.monotonic()
         probe_exchanges = 0
-        if result['before']['info']['fault_locked']:
+        if (result['before'] or {}).get('info', {}).get('fault_locked'):
             raise RuntimeError('Firmware fault already latched; refuse to load the target')
 
         if args.port:
@@ -574,26 +646,34 @@ def main():
                 run_intrusive(cycles)
             if total_ms >= args.outlier_ms or (args.probe_every
                                                and exchanges % args.probe_every == 0):
-                snapshot = read_counters()['stats']
-                delta = {k: snapshot[k] - last_counters.get(k, 0) for k in STATS}
-                last_counters = snapshot
-                now = time.monotonic()
-                window_ms = (now - probe_at) * 1000.0
-                window_calls = exchanges - probe_exchanges
-                probe_at, probe_exchanges = now, exchanges
-                rate = round(delta['tx'] / (window_ms / 1000.0), 1) if window_ms else None
-                if total_ms >= args.outlier_ms:
+                record = {'cycle': cycles, 'total_ms': round(total_ms, 2),
+                          'unix': time.time()}
+                snapshot = read_counters()
+                if snapshot:
+                    stats = snapshot['stats']
+                    delta = {k: stats[k] - last_counters.get(k, 0) for k in STATS}
+                    last_counters = stats
+                    now = time.monotonic()
+                    window_ms = (now - probe_at) * 1000.0
+                    window_calls = exchanges - probe_exchanges
+                    probe_at, probe_exchanges = now, exchanges
+                    rate = round(delta['tx'] / (window_ms / 1000.0), 1) if window_ms else None
                     # tx/s tells a slow-but-healthy exchange (hundreds of
                     # retransmissions per second) from a silent radio (near
                     # zero): the latter is radio_send() failing without a
                     # counter on one of the two boards.
-                    outliers.append({'cycle': cycles, 'total_ms': round(total_ms, 2),
-                                     'unix': time.time(), 'delta': delta,
-                                     'window_ms': round(window_ms, 1),
-                                     'window_exchanges': window_calls,
-                                     'tx_per_second': rate})
+                    record.update({'delta': delta, 'window_ms': round(window_ms, 1),
+                                   'window_exchanges': window_calls,
+                                   'tx_per_second': rate})
+                if total_ms >= args.outlier_ms:
+                    outliers.append(record)
         if not failed:
-            probe.exchange('config_disconnect', bytes((0x03,)))
+            # Best effort: the WCH-LinkW never answers DAP_Disconnect, and a
+            # 5 s timeout here would turn a clean run into a failed one.
+            try:
+                probe.exchange('config_disconnect', bytes((0x03,)))
+            except BaseException as error:
+                result['disconnect_error'] = str(error)
             result['after'] = read_counters()
     except BaseException as error:
         result['error'] = str(error)
@@ -629,6 +709,9 @@ def main():
         result['resync_count'] = len(result['resyncs'])
         result['resyncs'] = result['resyncs'][-40:]
         result['exchanges'] = exchanges
+        # Requested duration is not the duration achieved: a stalled probe ends
+        # the run early, and that gap is the whole point of --stop-on-error.
+        result['elapsed_s'] = round(time.monotonic() - started, 2)
 
         latency = {}
         for name, samples in probe.latency.items():
@@ -654,17 +737,19 @@ def main():
                                     'max': round(everything[-1], 2),
                                     'mean': round(statistics.fmean(everything), 2)}
 
-        final_info = result.get('final', {}).get('info', {})
+        final_info = (result.get('final') or {}).get('info') or {}
         result['fault_latched'] = final_info.get('fault_locked')
-        stats_before = result.get('before', {}).get('stats', {})
-        stats_after = result.get('final', {}).get('stats', {})
-        result['delta'] = {key: stats_after.get(key, 0) - stats_before.get(key, 0)
-                           for key in STATS}
+        stats_before = (result.get('before') or {}).get('stats') or {}
+        stats_after = (result.get('final') or {}).get('stats') or {}
+        # An empty delta is not an all-zero one: without the vendor counters there
+        # is nothing to claim about request timeouts.
+        result['delta'] = ({key: stats_after.get(key, 0) - stats_before.get(key, 0)
+                            for key in STATS} if stats_before and stats_after else {})
         failures = sum(entry['fails'] for entry in result['functional_checks'].values())
         result['functional_failures_total'] = failures
         result['passed'] = (failures == 0 and not failed
-                            and result.get('fault_latched') is False
-                            and result['delta'].get('request_timeouts') == 0
+                            and result.get('fault_latched') in (False, None)
+                            and result['delta'].get('request_timeouts') in (0, None)
                             and 'error' not in result
                             and not result.get('final_error')
                             and (not args.port or cdc['bytes'] > 0))
