@@ -44,8 +44,13 @@ python tools/capture_uart.py --port COM13 --dtr --baud 115200 --seconds 30 --out
 - 从机复位、断电或新会话会清除最近响应缓存；去重不跨断电保证。
 - 没有 NRST，不能使用硬件复位或 connect-under-reset。Cortex-M 软件复位依赖目标 MEM-AP 可访问。
 - SWJ 时钟接受 100 kHz–1 MHz 请求值，实际 GPIO 频率仍待标定。默认从 100 kHz 开始。
+- 用了 `DAP_SWD_Sequence`（`0x1d`）且含读操作后，必须补一条线复位再继续普通事务：实测不补的话目标从下一条事务起就不再应答（`05 00 08`，`SWD_ERROR`），补一条 `0x12` 64 位 0xFF 就恢复（详见[排查记录 §11.4](bulk-cdc-investigation.md)）。
+- 若出现“请求照样 1.5 s 超时、但 `stats` 里 `tx` 增长增量为 0、`tx_failures` 也为 0”的静默状态，就是 `radio_send()` 卡在 `sending`：`APPLY` 会被 `radio_is_idle()` 挡住，只能拔插主机 USB 复位（[§11.5](bulk-cdc-investigation.md)）。
+- 真实调试负载下 `retransmissions` 不再等于空口丢帧：15 字块读要 29–41 ms，超过 20 ms 的 RTO 下限，每个块读必然重传一次。看链路质量应改看 `crc_errors` 与 `drops`；`rejected` 也会因重传后的重复应答而增长（[§11.3](bulk-cdc-investigation.md)）。
 
 固件 1.3.1 将正常物理 SWD 操作与额外重试预算分离，正常操作最多 48 次、额外 WAIT/匹配重试最多 32 次。模型验证合法 64 字节报文不会再因旧 32 次预算被截断；真实 WAIT/FAULT 仍可能造成部分完成。HID / Bulk 分别直连已通过下述上板测试。**Bulk 与 CDC 并发的重传预算、超时响应形状已在 1.3.2 修复并上板复测**（见[排查记录](bulk-cdc-investigation.md)）；`SET_INTERFACE` 跨接口复位仍只有原生测试覆盖。
+
+**2026-10-24 真实 SWD 负载复测（1.3.2）：**用 `tools/swd_workload.py` 对 STM32F103C8T6 跑多事务 `DAP_Transfer` + 15 字块读写 + `DAP_SWD_Sequence` + halt/寄存器/死栈往返，三组各 120 s（Bulk 单独、Bulk+CDC @100 kHz、Bulk+CDC @1 MHz）与一次 OpenOCD/GDB 并发回放全部通过：约 2.9 万次 DAP 事务、**0 次请求超时、无锁存、无数据损坏**，其中 flash 块读逐次逐位比对、RAM 写入-回读-恢复逐字节一致。CDC 并发把 p99 从 67 抬到 146 ms，距 1500 ms 截止线仍有 5 倍余量。数据与两个新发现的缺陷见[排查记录 §11](bulk-cdc-investigation.md)。
 
 旧 1.3.0 从机可使用保留的 32 字节兼容桥。在一个终端运行：
 
@@ -93,6 +98,7 @@ CDC 初次启用时曾记录 8 B 丢弃和一次硬件 overrun，与启用前 FI
 - `tools/verify_bulk_cdc_fixes.py --port COM14`：用 `SET_INTERFACE(2)` 前后线路编码与 CDC 字节流是否存活来验证跨接口复位修复。需要能对接口 2 发控制传输的环境（Windows 上 libusb 做不到，因为在 usbser 手里）。
 - `tools/hid_smoke.py --expect-wireless`：USB/DAP 基础验证。
 - `tools/swd_identify.py`：读取目标 DP / MEM-AP 身份。
+- `tools/swd_workload.py [--port COM13] [--seconds 120] [--speed 100000]`：真实 SWD 负载压测。每周期发多事务 `DAP_Transfer`、15 字 flash 块读（满 64 字节包）与 `DAP_SWD_Sequence` 原始捕获，每 `--debug-every` 周期做一次 halt / 读 DHCSR 与 SP、PC / 死栈区块读写往返 / resume；每一步都校验 SWD ACK 与数据内容（flash 不可变比对、RAM 往返比对），并逐事务计时、离群时回读固件计数器。`--port` 开关并发 CDC。先关闭 OpenOCD。
 - `tools/verify_oled_gdb.py`：OLED 示例的 GDB 自动验证，会复位并控制目标；运行前关闭其他 OpenOCD 实例。
 - `examples/ks2-oled/scripts/render_buffer.py`：将 1024 B OLED 页式缓冲转为 PNG。
 

@@ -245,12 +245,93 @@ build/host-venv/Scripts/python tools/bulk_cdc_diagnostic.py --snapshot-only --ou
 
 - **`SET_INTERFACE(2)` 隔离**：需要接口收件人的控制传输，而 Windows 上 libusb 只能对已 claim 的接口做控制传输；接口 2 被 usbser 占用，因此 `libusb_control_transfer` 返回 `LIBUSB_ERROR_NOT_SUPPORTED`（已实测：设备收件人可以，接口收件人不行）。该项仍由 `tests/test_usb.c` 钉住；如需上板验证，可用 USB 分析仪或对接口 2 临时绑定 WinUSB（会失去 COM 口）。工具已备在 `tools/verify_bulk_cdc_fixes.py`。
 
-> **未测到的分支**：`fault` 锁存发生在 **phase 2** 超时。要在保持会话的前提下让对端不答，需要从机重启/从机 APPLY/外来 HELLO，主机侧无此开关（`APPLY` 本身会清 `session`）。该分支仍由 `tests/test_app.c:test_timeout_fault_lock_and_generation` 覆盖。
+> **未测到的分支**：`fault` 锁存发生在 **phase 2** 超时。要在保持会话的前提下让对端不答，需要从机重启/从机 APPLY/外来 HELLO，主机侧无此开关（`APPLY` 本身会清 `session`）。该分支由 `tests/test_app.c:test_timeout_fault_lock_and_generation` 覆盖；2026-10-24 的强杀客户端意外在板子上触发了同一条路径，见 §11.5 末尾的方框。
 
-## 11. 相关文件
+## 11. 真实 SWD 负载复测（2026-10-24 15:35–15:45）
+
+### 11.1 为什么要换负载
+
+§2 和 §10 的交错压测只用两种探针：`DAP_Info`（从机自己回答，5 B 请求 / 4 B 应答）和一次 DP IDCODE 读（一条物理 SWD 事务）。两者都是最便宜的交换，64 字节的 Bulk 包只用了几字节。真实调试器不是这么说话：OpenOCD 会发多事务 `DAP_Transfer`（选 bank + 写 TAR + 读 DRW 打在一个请求里）、15 字的 `DAP_TransferBlock`（4 + 4×15 = 64 B，正好占满应答包）、块写，以及 `DAP_SWD_Sequence` 原始捕获。这些请求让射频帧变长、让从机忙上几十毫秒，正是历史超时发生的那类负载。
+
+新工具 `tools/swd_workload.py` 直接对真实目标（STM32F103C8T6，IDCODE `0x1BA01477`）跑这套负载，并把每个应答当断言而不是流量：
+
+- 每个周期 4 个 DAP 请求：DP IDCODE → `DAP_Transfer`（SELECT + CSW + TAR + AP 读，共 4 个事务）→ 15 字 flash 块读（满包）→ `DAP_SWD_Sequence` 原始 IDCODE 捕获，再补线复位与空闲。
+- 每 20 个周期做一次真调试器会做的事：halt → 读 DHCSR → 经 DCSR/DCRDR 读 SP 与 PC → 在 SP 以下的死栈区做 14 字块读 / 块写 / 回读 / 恢复 → resume → 确认 `S_HALT` 清零。
+- 校验：IDCODE 恒为 `0x1BA01477`；flash 块读必须逐次逐位相同（不可变内存 = 载荷损坏判据）；SP 落在 SRAM、PC 落在 Flash；RAM 写入-回读-恢复逐字节一致。
+
+```powershell
+build/host-venv/Scripts/python tools/swd_workload.py --seconds 120
+build/host-venv/Scripts/python tools/swd_workload.py --port COM13 --seconds 120
+```
+
+### 11.2 结果（各 120 s，同一目标、同一信道）
+
+| 指标 | A：Bulk 单独 | B：Bulk + CDC（100 kHz） | C：Bulk + CDC（1 MHz） |
+| --- | --- | --- | --- |
+| 周期 / DAP 事务 | 992 / 6197 | 671 / 4191 | 733 / 4578 |
+| 延迟 p50 / p90 | 7.85 / 38.13 ms | 12.87 / 59.44 ms | 10.84 / 47.54 ms |
+| 延迟 p99 / p999 | 67.23 / 223.63 ms | 146.49 / 300.80 ms | 145.84 / 300.56 ms |
+| 延迟 max | 298.41 ms | 388.73 ms | 373.15 ms |
+| `crc_errors` | 76 | 110 | 133 |
+| `retransmissions` / `completed` | 38 % | 35 % | 36 % |
+| `request_timeouts` | 0 | 0 | 0 |
+| `fault_locked` | false | false | false |
+| `tx_failures` / `tx_timeouts` | 0 / 0 | 2 / 2 | 3 / 3 |
+| 功能校验 | 全部 100 % | 全部 100 % | 全部 100 % |
+| CDC 收到 | — | 5795 B / 95 行 | 5795 B / 95 行 |
+
+三组都没有一次请求超时、没有锁存、没有一次数据损坏，`drops` 全为 0。CDC 并发把尾部抬高约 30–40 %（p99 67 → 146 ms、p999 224 → 301 ms），但离 1500 ms 截止线仍有 5 倍以上余量。
+
+端到端再跑一次原失效场景（`tools/verify_oled_gdb.py --bulk` 并发 `tools/capture_uart.py`）：GDB 输出 `HARDWARE_VALIDATION_PASS`（软件复位、main/oled_update 硬件断点、单步、RAM 参数修改、暂停恢复、1 KiB 帧缓冲读取），同时 CDC 收到 2826 B，目标 `frames` 0 → 232、`ready=1`、`i2c_errors=0`、`fault=0`。
+
+累计（本次上电复位后）：**28886 次完成、0 次请求超时**、`fault` 从未锁存、`tx_failures` 5 次且全部被重传吸收。设备同时报告 `DAP_Info(4) = "1.3.2"`，确认两块板都是新镜像。
+
+### 11.3 真实负载下重传率不再等于空口丢帧率
+
+15 字块读的服务时间 p50 = 40.9 ms（100 kHz）/ 28.9 ms（1 MHz），**都高于 RTO 下限 20 ms**，所以主机在读块期间必然重传一次：这就是 35–38 % 的重传率配 1.4 % CRC 错误的来源。§10.2 用 1 字探针测到的 9.6 % 才接近纯空口丢帧。
+
+同一机制解释 `rejected`：RTO 到期重传会让从机重发缓存应答，而主机此时已在 phase 3，于是计一次 `link_rejected`（A 组 813、B 组 1、C 组 0——取决于应答到达时刻，与链路质量无关）。读 `link_rejected` 时要知道这一点。
+
+顺带一个结论：把 SWD 时钟从 100 kHz 提到 1 MHz 只把块读 p50 从 40.9 ms 压到 28.9 ms（−29 %）。慢的不是 SWD 位时间，而是每个 AP 事务的固定开销（读 + 强制 RDBUFF + GPIO/延时），靠提时钟改善大批量传输效果有限。
+
+### 11.4 新缺陷：`DAP_SWD_Sequence` 读序列后必须补线复位
+
+A/B 实测（各 3 轮，脚本见 Git 忽略的 `build/swd-raw-abi.py`）：
+
+| 做法 | 捕获本身 | 之后 5 次 DP IDCODE |
+| --- | --- | --- |
+| 捕获后发线复位 + 空闲 | 5/5 正确 | 5/5 正确 |
+| 捕获后不发线复位 | 第 1 次正确，之后全 1 | 0/5，全部 `SWD_ERROR` |
+
+现象：`0x1d` 请求本身成功（ACK=1、数据 `0x1BA01477`），但紧随其后的任何 `DAP_Transfer` 都返回 `05 00 08`（`SWD_ERROR = 8`，读不到有效 ACK），再往后连 `0x1d` 自己也只能读到全 1（目标已不再驱动 SWDIO）。发一条线复位（`0x12` 64 位 0xFF）即恢复：3/3 复现、3/3 恢复。
+
+源码定位：`src/swd.c` 里 `swd_read_sequence()` 是唯一以 `dio_in()` 结束、不恢复 `dio_out()` 的路径；`swd_transfer()` 的三条分支（正常读、正常写、WAIT/FAULT/无效 ACK）都以 `dio(1); dio_out()` 收尾。读序列固定读 40 位而实际应答 37 位，多出的 3 个周期里 SWDIO 处于释放态，之后也没有人把线拉回输出高。`tools/swd_identify.py` 一直靠"每次捕获后补线复位"规避，所以这个坑之前没被踩到。
+
+建议修复（未实施，需烧录验证）：`swd_read_sequence()` 结束处补 `dio(1); dio_out();`，并考虑在尾部补 2–3 个驱动空闲周期。`swd_workload.py` 目前按"捕获后线复位"写，并对每一步校验状态字节、必要时自动重同步（本次三组跑共 0 次重同步）。
+
+### 11.5 新缺陷：主机可进入"静默静音"状态
+
+强杀压测客户端（留下一个未取走的 Bulk 应答）后，主机进入如下状态：
+
+- DAP 请求照样在 **1.500 s** 后超时并返回合成形状（`00 00`、`02 00`、`12 ff`、`05 00 08`），`request_timeouts` 逐次 +1；
+- 但整个 1.5 s 窗口内 **`tx` 增量为 0**，`tx_failures`、`tx_timeouts` 也都是 0——`radio_send()` 一帧都没发，而且走的是唯一不计数的那条路径 `if (sending) return false;`（`src/radio.c`）；
+- `WD_CTL_APPLY` 返回 OK 但只是暂存，真正的 `radio_reconfigure()` 在 500 ms 后要等 `radio_is_idle()`（= `!sending && !ready`），永远等不到；`WD_CTL_IDLE` 返回 INVALID；
+- 换代也救不了：`SET_INTERFACE(1)` 因传输未变而不 `++generation`；切到 HID 能 `++generation` 并清掉 `fault`，但射频静音照旧；
+- 唯一恢复手段是复位：拔插主机 USB 后计数器全零。这也解释了现场历史上"只拔插主机 USB 即恢复"为什么有效。
+
+建议修复（未实施）：给 `sending` 加超时看护——超过 N ms（例如 100 ms）仍未收到 TX 完成中断，就按发送失败处理：清 `sending`、`start_rx()`、`++tx_timeouts`，让下一次重传有机会发出。
+
+> 一次副作用收获：强杀时那个未完成的请求正好按 **phase 2** 超时，`fault` 被锁存（`request_timeouts` +1、`fault=1`，之后所有命令都返回合成形状）。这补上了 §10.6 遗留的"phase-2 分支只有原生测试覆盖"。`fault` 随后被 HID 换代的 `generation` 变化清零，与设计一致。
+
+### 11.6 仍不可观测的一项
+
+`radio_stats_t` 里有 `rx_timeouts`（接收机重挂失败计数），但 `WD_CTL_STATS` 的 12 个字段里没有它，所以"接收机失聪"仍然无法远程确认，只能靠"主机 `tx` 正常增长但 `rx` 不动"间接判断。建议把它加进应答——会改变 `WD_CTL_STATS` 的长度，需同步改工具与文档。
+
+## 12. 相关文件
 
 - `docs/findings-link.md`：主机调度器 + RF 链路审计（RTO 饱和的算术推导、各机制事件轨迹与 `WD_CTL_STATS` 指纹表、F1–F7 建议、T1–T7 测试设计）。
 - `docs/findings-usb.md`：USB 复合层审计（SFR 级缓冲核对、`request_state` 闭包与活性、C1–C6 缺陷、mock 能力边界）。
 - `tools/bulk_cdc_stress.py`：交错压测工具（逐事务计时 + 离群时抓计数器）。
 - `tools/induce_timeout.py`：可逆地制造一次真实 1500 ms 超时，抓取合成响应形状。
 - `tools/verify_bulk_cdc_fixes.py`：`SET_INTERFACE` 隔离与 CDC 存活的线上验证（需能对接口 2 发控制传输的具体环境）。
+- `tools/swd_workload.py`：真实 SWD 负载压测（多事务 `DAP_Transfer`、15 字块读写、`DAP_SWD_Sequence`、halt/寄存器/死栈往返），逐事务计时、逐步校验 ACK、离群时回读计数器，可选并发 CDC。
