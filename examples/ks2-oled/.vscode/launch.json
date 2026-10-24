@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "CH570Q: OLED 无线调试（先运行 debug-server）",
+      "type": "cortex-debug",
+      "request": "attach",
+      "servertype": "external",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/build/ks2-oled.elf",
+      "gdbPath": "arm-none-eabi-gdb",
+      "gdbTarget": "${input:gdbTarget}",
+      "device": "STM32F103C8",
+      "preLaunchTask": "build",
+      "liveWatch": {"enabled": false},
+      "showDevDebugOutput": "raw"
+    }
+  ],
+  "inputs": [
+    {"id": "gdbTarget", "type": "promptString", "description": "CH570Q OpenOCD GDB 地址（debug-server 任务默认 localhost:3333）", "default": "localhost:3333"}
+  ]
+}

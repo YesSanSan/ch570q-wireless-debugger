@@ -1,0 +1,29 @@
+# Build products and local dependencies
+build*/
+.cache/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Generated firmware and host artifacts
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.obj
+*.exe
+*.log
+compile_commands.json
+
+# Local editor / OS files
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local credentials
+.env
+.env.*
+!.env.example

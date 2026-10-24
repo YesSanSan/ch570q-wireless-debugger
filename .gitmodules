@@ -1,0 +1,3 @@
+[submodule "vendor/ch570"]
+	path = vendor/ch570
+	url = https://github.com/openwch/ch570.git

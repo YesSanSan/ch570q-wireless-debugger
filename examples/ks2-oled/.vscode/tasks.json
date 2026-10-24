@@ -1,0 +1,55 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "configure",
+      "type": "process",
+      "command": "cmake",
+      "args": ["-S", "${workspaceFolder}", "-B", "${workspaceFolder}/build", "-G", "Ninja"],
+      "problemMatcher": []
+    },
+    {
+      "label": "build",
+      "type": "process",
+      "command": "cmake",
+      "args": ["--build", "${workspaceFolder}/build"],
+      "dependsOn": "configure",
+      "group": {"kind": "build", "isDefault": true},
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "size",
+      "type": "process",
+      "command": "arm-none-eabi-size",
+      "args": ["${workspaceFolder}/build/ks2-oled.elf"],
+      "dependsOn": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "flash",
+      "type": "process",
+      "command": "openocd",
+      "args": ["-l", "build/flash-openocd.log", "-f", "ch570q.cfg", "-c", "program build/ks2-oled.elf verify reset exit"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "dependsOn": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "debug-server",
+      "type": "process",
+      "command": "openocd",
+      "args": ["-l", "build/debug-openocd.log", "-f", "ch570q.cfg"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "verify-hardware",
+      "type": "process",
+      "command": "python",
+      "args": ["tools/verify_oled_gdb.py"],
+      "options": {"cwd": "${workspaceFolder}/../.."},
+      "dependsOn": "build",
+      "problemMatcher": []
+    }
+  ]
+}

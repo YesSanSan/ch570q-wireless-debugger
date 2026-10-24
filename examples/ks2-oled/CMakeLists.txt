@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.22)
+set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+find_program(CMAKE_C_COMPILER arm-none-eabi-gcc REQUIRED)
+set(CMAKE_ASM_COMPILER "${CMAKE_C_COMPILER}")
+project(ks2_oled LANGUAGES C ASM)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+find_program(ARM_OBJCOPY arm-none-eabi-objcopy REQUIRED)
+find_program(ARM_SIZE arm-none-eabi-size REQUIRED)
+add_executable(ks2-oled src/startup.S src/main.c src/board.c src/ssd1306.c)
+set_target_properties(ks2-oled PROPERTIES SUFFIX ".elf")
+target_include_directories(ks2-oled PRIVATE include)
+target_compile_options(ks2-oled PRIVATE -mcpu=cortex-m3 -mthumb -mfloat-abi=soft -Og -g3 -ffunction-sections -fdata-sections -fno-common $<$<COMPILE_LANGUAGE:C>:-std=c11;-Wall;-Wextra;-Werror;-ffreestanding>)
+target_link_options(ks2-oled PRIVATE -mcpu=cortex-m3 -mthumb -nostdlib -T${CMAKE_CURRENT_SOURCE_DIR}/stm32f103c8.ld -Wl,--gc-sections -Wl,-z,noexecstack -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/ks2-oled.map -Wl,--print-memory-usage)
+set_property(TARGET ks2-oled APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/stm32f103c8.ld")
+target_link_libraries(ks2-oled PRIVATE gcc)
+add_custom_command(TARGET ks2-oled POST_BUILD
+ COMMAND ${ARM_OBJCOPY} -O binary $<TARGET_FILE:ks2-oled> ${CMAKE_CURRENT_BINARY_DIR}/ks2-oled.bin
+ COMMAND ${ARM_OBJCOPY} -O ihex $<TARGET_FILE:ks2-oled> ${CMAKE_CURRENT_BINARY_DIR}/ks2-oled.hex
+ COMMAND ${ARM_SIZE} $<TARGET_FILE:ks2-oled>)
