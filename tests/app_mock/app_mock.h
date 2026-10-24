@@ -65,10 +65,12 @@ uint16_t usb_cdc_write(const uint8_t *data,uint16_t length) {
     assert(mock_usb_tx_len+length<=sizeof(mock_usb_tx));
     memcpy(mock_usb_tx+mock_usb_tx_len,data,length);mock_usb_tx_len+=length;return length;
 }
+bool usb_cdc_discard_pending(void) { mock_usb_rx_pos=mock_usb_rx_len;mock_usb_tx_len=0;return true; }
 void usb_cdc_get_line_coding(usb_cdc_line_coding_t *coding) { *coding=mock_line; }
 uint8_t usb_cdc_control_line_state(void) { return mock_dtr?1:0; }
 void usb_cdc_set_serial_state(uint16_t state) { mock_serial_state=state; }
 void radio_init(void) { ++mock_radio_inits; }
+void radio_poll(uint32_t now) { (void)now; }
 bool radio_reconfigure(const rf_config_t *config) { (void)config;return true; }
 bool radio_is_idle(void) { return true; }
 bool radio_get_hardware_id(uint8_t id[8]) { memset(id,0x11,8);return true; }

@@ -26,6 +26,7 @@ static void reset_app(void)
     discovery_start=discovery_nonce=discovery_due=discovery_reply_nonce=discovery_round=0;
     link_timeouts=link_retries=link_rejected=completed=0;
     fault=pending_response=discover_active=discover_reply_pending=apply_pending=false;
+    cdc_quarantined=reconnecting=false;response_started=reconnects=response_expirations=0;
     request_len=response_len=0;peer_count=0;stream_reset();last_stream=0;
 }
 static void step(uint32_t now) { mock_now=now;host_poll(now); }
@@ -47,7 +48,7 @@ static void answer(uint8_t accepted,const uint8_t *bytes,uint8_t count)
         packet.length=4+count;packet.data[1]=WD_STATUS_OK;
         packet.data[2]=accepted;packet.data[3]=count;
         if(count)memcpy(packet.data+4,bytes,count);
-    } else {packet.length=2;packet.data[1]=0;}
+    } else {packet.length=2;packet.data[1]=(request[0]==0x02 && request[1]<=1)?1:0;}
     queue_packet(&packet);
 }
 static void dap_request(uint8_t command)
@@ -198,7 +199,8 @@ static void test_generation_discards_inflight_cdc(void)
     mock_generation=2;mock_dtr=false;mock_usb_configured=false;
     step(11);
     assert(!cdc_tx_len && !phase && !session && !mock_usb_tx_len && link_rejected==1);
-    mock_usb_configured=true;mock_dtr=true;step(20);
+    mock_usb_configured=true;mock_dtr=false;step(12);
+    mock_dtr=true;step(20);
     struct link_packet hello=last_packet();assert(hello.type==LINK_HELLO);
     struct link_packet ack={0};ack.type=LINK_HELLO_ACK;ack.sequence=hello.sequence;ack.session=0x8888;
     queue_packet(&ack);step(21);
@@ -240,17 +242,14 @@ static void test_short_bulk_control_response(void)
     uint8_t command=WD_CMD_REMOTE,out[64];
     assert(dispatch(&command,1,out,sizeof(out))==3 && out[2]==WD_STATUS_INVALID);
 }
-/* A synthesized timeout reply must keep the exact response shape of its command:
- * a host parses the short packet by command, so a malformed one desynchronises
- * it instead of failing it. DAP_TransferBlock (0x06) used to answer
- * {0x06, count=0, response=0x00}, i.e. "OK, zero words transferred", and
- * DAP_SWD_Sequence (0x1d) answered two bytes instead of three. */
+/* Synthesized errors follow command-specific CMSIS-DAP layouts, including
+ * the 16-bit TransferBlock count and the SWD_Sequence status byte. */
 static void test_timeout_reply_shapes(void)
 {
     static const uint8_t command[]={0x06,0x1d,0x05,0x0a,0x10,0x02};
-    static const uint8_t expected[][3]={ {0x06,0x00,0x08}, {0x1d,0x00,0x08}, {0x05,0x00,0x08},
-                                        {0x0a,0xff,0x00}, {0x10,0x80,0x00}, {0x02,0x00,0x00} };
-    static const uint8_t length[]={3,3,3,3,2,2};
+    static const uint8_t expected[][4]={ {0x06,0x00,0x00,0x08}, {0x1d,0xff}, {0x05,0x00,0x08},
+                                        {0x0a,0xff,0x00}, {0x10,0x80}, {0x02,0x00} };
+    static const uint8_t length[]={4,2,3,3,2,2};
     for(unsigned i=0;i<sizeof(command);++i) {
         reset_app();dap_request(command[i]);step(10);assert(phase==2);
         step(1510);assert(fault && phase==3 && link_timeouts==1);
@@ -278,6 +277,127 @@ static void test_retry_budget_survives_saturated_rto(void)
     assert(!fault);
     assert(sends>=12); /* 3 retransmissions before the clamp, ~15 after */
 }
+static void test_explicit_reconnect_after_unknown_write(void)
+{
+    reset_app();dap_request(0x05);step(10);
+    struct link_packet old=last_packet();step(1510);step(1511);
+    assert(fault && !phase);
+    unsigned sends=mock_rf_tx_count;
+    dap_request(0x05);step(1512);step(1513);
+    assert(fault && sends==mock_rf_tx_count); /* No implicit replay. */
+    dap_request(0x02);mock_dap_request[1]=1;step(1514);
+    struct link_packet hello=last_packet();
+    assert(fault && reconnecting && phase==1 && hello.type==LINK_HELLO && !session);
+    struct link_packet stale={0};stale.type=LINK_RESPONSE;stale.session=old.session;
+    stale.sequence=old.sequence;stale.length=2;stale.data[0]=0x05;queue_packet(&stale);
+    struct link_packet ack={0};ack.type=LINK_HELLO_ACK;ack.sequence=hello.sequence;ack.session=0x8888;
+    queue_packet(&ack);step(1515);
+    struct link_packet fresh=last_packet();
+    assert(fresh.type==LINK_REQUEST && fresh.data[0]==0x02 && fresh.data[1]==1);
+    assert(fresh.session==0x8888 && fresh.sequence==1 && link_rejected);
+    answer(0,NULL,0);step(1516);assert(!fault && phase==0 && reconnects==1);
+    /* Same-millisecond reconnects cannot obtain the old HELLO's cache. */
+    uint32_t first_nonce=nonce;uint8_t cmd[]={WD_CMD_LOCAL,WD_CTL_RECONNECT},out[64];
+    assert(control(cmd,sizeof(cmd),out,sizeof(out),true)==3 && out[2]==WD_STATUS_OK);
+    begin_request(1516);assert(nonce!=first_nonce);
+    struct link_packet late_ack=ack;queue_packet(&late_ack);step(1517);
+    assert(phase==1 && !session);
+}
+static void test_reconnect_control_and_cdc_quarantine(void)
+{
+    reset_app();mock_dtr=true;memcpy(mock_usb_rx,"old",3);mock_usb_rx_len=3;
+    step(10);assert(cdc_tx_len==3 && owner==1);step(1510);step(1511);
+    assert(fault && cdc_quarantined && !cdc_tx_len);
+    uint8_t cmd[]={WD_CMD_LOCAL,WD_CTL_RECONNECT},out[64];
+    assert(control(cmd,2,out,64,true)==3 && out[2]==WD_STATUS_BUSY && fault);
+    assert(control(cmd,2,out,64,false)==3 && out[2]==WD_STATUS_DENIED && fault);
+    dap_request(0x02);mock_dap_request[1]=1;step(1512);
+    struct link_packet hello=last_packet(),ack={0};
+    ack.type=LINK_HELLO_ACK;ack.sequence=hello.sequence;ack.session=0x9999;queue_packet(&ack);
+    step(1513);answer(0,NULL,0);step(1514);
+    unsigned sent=mock_rf_tx_count;step(1520);
+    assert(cdc_quarantined && mock_rf_tx_count==sent); /* High DTR cannot auto-resume old stream. */
+    memcpy(mock_usb_rx,"tail",4);mock_usb_rx_len=4;mock_usb_rx_pos=0;mock_dtr=false;
+    step(1521);assert(!cdc_quarantined && mock_usb_rx_pos==4);
+    mock_dtr=true;step(1530);assert(last_packet().data[9]==0);
+    reset_app();fault=true;session=0x1234;cdc_tx_len=3;
+    assert(control(cmd,2,out,64,true)==3 && out[2]==WD_STATUS_OK);
+    assert(!fault && !session && sequence==1 && !cdc_tx_len && reconnects==1);
+}
+static void test_slave_response_expiry_keeps_cached_write(void)
+{
+    reset_app();role=RF_CONFIG_ROLE_SLAVE;
+    struct link_packet hello={0};hello.type=LINK_HELLO;hello.sequence=77;queue_packet(&hello);
+    mock_now=100;slave_poll(100);slave_poll(101);assert(!pending_response);
+    struct link_packet write={0};write.type=LINK_REQUEST;write.session=slave.session;write.sequence=1;
+    uart_payload(write.data,1,"once");write.length=14;queue_packet(&write);
+    mock_rf_send_ok=false;mock_now=110;slave_poll(110);
+    assert(pending_response && mock_uart_tx_len==4 && slave.have_cache);
+    uint8_t cached[78];memcpy(cached,slave.last_response,78);
+    slave_poll(209);assert(pending_response && !response_expirations);
+    queue_packet(&write);mock_now=210;slave_poll(210);
+    assert(response_expirations==1 && pending_response && mock_uart_tx_len==4);
+    assert(!memcmp(cached,slave.last_response,78) && slave.next_sequence==2);
+    mock_rf_send_ok=true;slave_poll(211);assert(!pending_response);
+    assert(!memcmp(cached,mock_rf_tx[mock_rf_tx_count-1],78));
+    /* Expiry also releases HELLO reception, without resetting a cached write early. */
+    pending_response=true;response_started=UINT32_MAX-49;mock_rf_send_ok=false;
+    hello.sequence=78;queue_packet(&hello);mock_now=50;slave_poll(50);
+    assert(response_expirations==2 && slave.hello_nonce==78 && pending_response);
+}
+static void test_host_restart_nonce_collision(void)
+{
+    reset_app();struct link_slave peer;link_slave_init(&peer);
+    uint8_t frame[78],reply[78];struct link_packet p={0};
+    p.type=LINK_HELLO;p.sequence=1;assert(link_encode(&p,frame));
+    assert(link_slave_handle(&peer,frame,reply,0x1111,dispatch,reset_dispatch));
+    p.type=LINK_REQUEST;p.session=peer.session;p.sequence=1;p.length=2;p.data[0]=0x02;p.data[1]=1;
+    assert(link_encode(&p,frame));assert(link_slave_handle(&peer,frame,reply,0,dispatch,reset_dispatch));
+    unsigned executions=mock_dap_calls;
+    session=0;nonce=0;dap_request(0x02);mock_dap_request[1]=1;step(10);
+    assert(last_packet().sequence==1); /* Repeated boot seed. */
+    assert(link_slave_handle(&peer,mock_rf_tx[mock_rf_tx_count-1],reply,0x2222,dispatch,reset_dispatch));
+    assert(mock_rf_rx_head<32);memcpy(mock_rf_rx[mock_rf_rx_head++],reply,78);step(11);
+    assert(phase==1 && nonce==2 && !session && started==10 && mock_dap_calls==executions);
+    assert(link_slave_handle(&peer,mock_rf_tx[mock_rf_tx_count-1],reply,0x2222,dispatch,reset_dispatch));
+    memcpy(mock_rf_rx[mock_rf_rx_head++],reply,78);step(12);
+    assert(phase==2 && session==0x2222 && last_packet().sequence==1 && last_packet().data[0]==0x02);
+    assert(mock_dap_calls==executions); /* No request dispatched until fresh handshake. */
+}
+static void test_generation_discards_unread_usb_suffix(void)
+{
+    reset_app();mock_dtr=true;memset(mock_usb_rx,'S',64);mock_usb_rx_len=64;
+    step(10);assert(cdc_tx_len==54 && mock_usb_rx_pos==54);
+    mock_generation=2;step(11);
+    assert(cdc_quarantined && mock_usb_rx_pos==64 && !cdc_tx_len);
+    unsigned sent=mock_rf_tx_count;step(20);assert(mock_rf_tx_count==sent);
+    mock_dtr=false;step(21);assert(!cdc_quarantined);
+    mock_dtr=true;step(30);assert(last_packet().type==LINK_HELLO);
+    struct link_packet ack={0};ack.type=LINK_HELLO_ACK;ack.sequence=nonce;ack.session=0x5555;
+    queue_packet(&ack);step(31);assert(last_packet().data[9]==0);
+    uint8_t cmd[]={WD_CMD_LOCAL,WD_CTL_RECOVERY_STATS},out[64];
+    assert(control(cmd,2,out,64,true)==38 && out[3]==1);
+}
+static void test_failed_reconnect_keeps_fault(void)
+{
+    for(unsigned fail_phase=1;fail_phase<=3;++fail_phase) {
+        reset_app();fault=true;dap_request(0x02);mock_dap_request[1]=1;step(10);
+        assert(fault && reconnecting && phase==1);
+        if(fail_phase>=2) {
+            struct link_packet ack={0};ack.type=LINK_HELLO_ACK;ack.sequence=nonce;ack.session=0x7777;
+            queue_packet(&ack);step(11);assert(phase==2 && fault);
+        }
+        if(fail_phase==3) {
+            struct link_packet bad={0};bad.type=LINK_RESPONSE;bad.session=session;bad.sequence=sequence;
+            bad.length=2;bad.data[0]=0x02;bad.data[1]=0;queue_packet(&bad);step(12);
+        } else {step(fail_phase==1?1510:1511);step(1512);}
+        assert(fault && !reconnecting && !phase);
+        unsigned sent=mock_rf_tx_count;dap_request(0x05);step(1520);
+        assert(fault && sent==mock_rf_tx_count);
+    }
+    reset_app();mock_dtr=false;memset(mock_usb_rx,'Q',10);mock_usb_rx_len=10;
+    mock_generation=2;step(10);assert(mock_usb_rx_pos==10); /* No app stream state, but EP3 had data. */
+}
 int main(void)
 {
     test_real_main_startup();test_shared_dap_cdc_sequence();
@@ -286,6 +406,10 @@ int main(void)
     test_short_bulk_control_response();test_invalid_settings_and_pending_close();
     test_timeout_reply_shapes();test_retry_budget_survives_saturated_rto();
     test_timeout_fault_lock_and_generation();test_generation_discards_inflight_cdc();
+    test_explicit_reconnect_after_unknown_write();test_reconnect_control_and_cdc_quarantine();
+    test_slave_response_expiry_keeps_cached_write();
+    test_host_restart_nonce_collision();test_generation_discards_unread_usb_suffix();
+    test_failed_reconnect_keeps_fault();
     puts("App tests passed: real startup, shared DAP/CDC sequence, cached UART replies, partial TX, DTR drain, RX backpressure, invalid coding, timeout lock, timeout reply shapes, retry budget, generation isolation");
     return 0;
 }

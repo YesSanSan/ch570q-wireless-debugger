@@ -54,6 +54,10 @@ try {
     if ($LASTEXITCODE) { throw 'Compile no-log UART bridge tests failed' }
     & ./build/native/test_uart_bridge_nolog.exe
     if ($LASTEXITCODE) { throw 'No-log UART bridge tests failed' }
+    gcc -std=c11 -Wall -Wextra -Werror -I tests/radio_mock -I include tests/test_radio.c -o build/native/test_radio.exe
+    if ($LASTEXITCODE) { throw 'Compile radio recovery tests failed' }
+    & ./build/native/test_radio.exe
+    if ($LASTEXITCODE) { throw 'Radio recovery tests failed' }
     gcc -std=c99 -Wall -Wextra -Werror -I tests/app_mock -I include tests/test_app.c src/link.c src/retry.c -o build/native/test_app.exe
     if ($LASTEXITCODE) { throw 'Compile unified app tests failed' }
     & ./build/native/test_app.exe

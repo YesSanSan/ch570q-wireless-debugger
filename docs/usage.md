@@ -38,9 +38,10 @@ python tools/capture_uart.py --port COM13 --dtr --baud 115200 --seconds 30 --out
 
 ## 连接与故障恢复
 
+**1.3.3 实现边界：**已加入射频看护和显式重连，原生测试及构建通过，并已于 2026-10-25 完成上板复测（结果见 [1.3.3 上板验收](v133-hardware-validation.md)）。遇到错误后先关闭 CDC 串口与 OpenOCD，再重新启动调试连接（合法 `DAP_Connect` 会建立新会话）；或执行 `python tools/debugger_ctl.py reconnect` 清理本地主机会话，再连接目标。可用 `python tools/debugger_ctl.py recovery-stats` 查看恢复计数。管理重连成功不表示远端已连通，旧请求不会重放。CDC 必须关闭 DTR 后重开——1.3.3 在每次 DAP 会话换代后隔离 CDC，只把 DTR 拉低一次才解除，直接以 DTR 高打开会收不到任何字节。完整行为及正确超时响应见 [1.3.3 重连实现](reconnection.md)。以下静默和烧录失败描述是 **1.3.2 的实测记录**；1.3.3 上板复测没有复现它们。
 - 首次上板使用固定主机/从机镜像，检查供电、共地、晶振及 ISP 恢复入口。
 - 先读取 DAP Info 和目标 DP IDCODE，再执行内存访问、下载及运行控制。
-- 请求超过 1.5 秒没有结果时，目标写入可能已经发生。主机会锁定调试会话；重新枚举主机 USB 后再连接目标。
+- 请求超过 1.5 秒没有结果时，目标写入可能已经发生。主机会锁定后续目标请求；1.3.3 允许显式 Connect/本地重连，Connect 失败仍保持门控。1.3.2 需重新枚举主机 USB，射频静默时仍需复位。
 - 从机复位、断电或新会话会清除最近响应缓存；去重不跨断电保证。
 - 没有 NRST，不能使用硬件复位或 connect-under-reset。Cortex-M 软件复位依赖目标 MEM-AP 可访问。
 - SWJ 时钟接受 100 kHz–1 MHz 请求值，实际 GPIO 频率仍待标定。默认从 100 kHz 开始。
@@ -50,9 +51,9 @@ python tools/capture_uart.py --port COM13 --dtr --baud 115200 --seconds 30 --out
 - 1 KiB 帧缓冲读取单次可用；**连续多次（约 4–24 s 内）会把整机卡成静默**，之后只能复位（[§12.5](bulk-cdc-investigation.md)）。
 - 真实调试负载下 `retransmissions` 不再等于空口丢帧：15 字块读要 29–41 ms，超过 20 ms 的 RTO 下限，每个块读必然重传一次。看链路质量应改看 `crc_errors` 与 `drops`；`rejected` 也会因重传后的重复应答而增长（[§11.3](bulk-cdc-investigation.md)）。
 
-固件 1.3.1 将正常物理 SWD 操作与额外重试预算分离，正常操作最多 48 次、额外 WAIT/匹配重试最多 32 次。模型验证合法 64 字节报文不会再因旧 32 次预算被截断；真实 WAIT/FAULT 仍可能造成部分完成。HID / Bulk 分别直连已通过下述上板测试。**Bulk 与 CDC 并发的重传预算、超时响应形状已在 1.3.2 修复并上板复测**（见[排查记录](bulk-cdc-investigation.md)）；`SET_INTERFACE` 跨接口复位仍只有原生测试覆盖。
+固件 1.3.1 将正常物理 SWD 操作与额外重试预算分离，正常操作最多 48 次、额外 WAIT/匹配重试最多 32 次。模型验证合法 64 字节报文不会再因旧 32 次预算被截断；真实 WAIT/FAULT 仍可能造成部分完成。HID / Bulk 分别直连已通过下述上板测试。1.3.2 的重传预算与 `SET_INTERFACE` 隔离有历史测试记录；其中超时响应格式判断错误，已在 [1.3.3 勘误](reconnection.md#超时响应格式勘误)纠正。
 
-**2026-10-24 真实 SWD 负载复测（1.3.2）：**用 `tools/swd_workload.py` 对 STM32F103C8T6 跑多事务 `DAP_Transfer` + 15 字块读写 + `DAP_SWD_Sequence` + halt/寄存器/死栈往返，三组各 120 s（Bulk 单独、Bulk+CDC @100 kHz、Bulk+CDC @1 MHz）与一次 OpenOCD/GDB 并发回放全部通过：约 2.9 万次 DAP 事务、**0 次请求超时、无锁存、无数据损坏**，其中 flash 块读逐次逐位比对、RAM 写入-回读-恢复逐字节一致。CDC 并发把 p99 从 67 抬到 146 ms。数据见[排查记录 §11](bulk-cdc-investigation.md)。
+**2026-10-24 真实 SWD 负载复测（1.3.2）：**三组各 120 s（Bulk 单独、Bulk+CDC @100 kHz、Bulk+CDC @1 MHz）共 14966 次 DAP 交换，通过 Flash 块读逐位校验、RAM 写入回读恢复及运行控制，无请求超时和数据损坏；约 2.9 万次是上电后的累计完成计数。CDC 并发把 p99 从 67 抬到 146 ms。后续连续块读仍复现失败，见下文和[排查记录 §11](bulk-cdc-investigation.md)。
 
 **同日的真实 GDB 复测推翻了“已彻底修好”的结论：**真 OpenOCD+GDB 跑 Flash 擦写、硬件断点、8x1 KiB 帧缓冲连读时，**连读 8 个 KiB 即复现了现场故障**（GDB 在帧缓冲读后的参数写入处报 `Cannot access memory`）。定位结果：不是重传预算耗尽，而是 `radio_send()` 的 `sending` 卡死导致的**射频静默**——失败窗口内 `tx` 增量为 0，清 `fault` 后仍死，只能复位；主机与从机两侧都能卡。硬件断点与单步两轮均通过；Flash 擦写走 OpenOCD 命令可用，GDB `load` 未通过。详见[排查记录 §12](bulk-cdc-investigation.md)。
 

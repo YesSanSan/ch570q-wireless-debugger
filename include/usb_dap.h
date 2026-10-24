@@ -60,6 +60,10 @@ typedef struct {
  * DTR is exposed, not required for transfer. Reset discards pending CDC data. */
 uint16_t usb_cdc_read(uint8_t *data, uint16_t capacity);
 uint16_t usb_cdc_write(const uint8_t *data, uint16_t length);
+/* Begin/retry cancellation of pending CDC IN/OUT. Returns true only after
+ * SIE is free and accepted old tokens were serviced. No busy wait; false keeps
+ * EP3 NAKed. Preserve coding, DTR, endpoint toggles and DAP ownership. */
+bool usb_cdc_discard_pending(void);
 void usb_cdc_get_line_coding(usb_cdc_line_coding_t *coding);
 uint8_t usb_cdc_control_line_state(void); /* bit 0 DTR, bit 1 RTS */
 uint16_t usb_cdc_break_duration(void); /* 0 stop, 0xffff indefinite, else ms */

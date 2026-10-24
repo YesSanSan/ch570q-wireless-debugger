@@ -16,6 +16,8 @@
 #define WD_CTL_IDLE 10u
 #define WD_CTL_APPLY 11u
 #define WD_CTL_UART_STATS 12u
+#define WD_CTL_RECONNECT 13u
+#define WD_CTL_RECOVERY_STATS 14u
 #define WD_STATUS_OK 0u
 #define WD_STATUS_INVALID 1u
 #define WD_STATUS_BUSY 2u

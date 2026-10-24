@@ -84,6 +84,56 @@ static void test_set_interface_isolation(void)
     assert(!cdc_tx_busy && !cdc_rx_length && !usb_cdc_read(rx, 1));
     assert(!R8_UEP3_T_LEN && usb_cdc_control_line_state() == 3);
 }
+static void test_cdc_recovery_discard(void)
+{
+    uint8_t data[64]={0},packet[64],length;uint32_t tag;
+    for(unsigned blocked=0;blocked<3;++blocked) {
+        usb_dap_init();R8_USB_INT_FG=0;configure();
+        setup(0x21,0x22,3,2,0);in0();
+        memset(ep3_buffer,0x5a,64);event(UIS_TOKEN_OUT,3,64,RB_UIS_TOG_OK);
+        assert(usb_cdc_write(data,64)==64);
+        ep2_buffer[0]=0x02;event(UIS_TOKEN_OUT,2,2,RB_UIS_TOG_OK);
+        assert(usb_dap_take_request_tagged(packet,&length,&tag));
+        uint32_t old_gen=generation;uint8_t toggles=R8_UEP3_CTRL&(RB_UEP_R_TOG|RB_UEP_T_TOG);
+        R8_USB_MIS_ST=RB_UMS_SIE_FREE;
+        if(blocked==1) suspended=1;
+        if(blocked==2) {halt_in|=1u<<3;halt_out|=1u<<3;cdc_update();}
+        assert(usb_cdc_discard_pending());
+        assert(!cdc_rx_length && !cdc_rx_offset && !cdc_tx_busy && !cdc_tx_length && !R8_UEP3_T_LEN);
+        assert((R8_UEP3_CTRL&(RB_UEP_R_TOG|RB_UEP_T_TOG))==toggles);
+        assert(generation==old_gen && request_state==REQ_PROCESSING && usb_cdc_control_line_state()==3);
+        suspended=0;halt_in=halt_out=0;cdc_update();
+        assert(!usb_cdc_read(data,64));
+        assert(usb_cdc_write(data,1)==1);event(UIS_TOKEN_IN,3,0,0);
+        assert(!cdc_tx_busy); /* Old full-packet ZLP was cancelled as well. */
+        assert(usb_dap_send_response_tagged(packet,length,tag));
+    }
+}
+static void test_cdc_discard_inflight_completion(void)
+{
+    for(unsigned direction=0;direction<2;++direction) {
+        uint8_t data[64]={0};usb_dap_init();R8_USB_INT_FG=0;configure();
+        R8_USB_MIS_ST=0; /* Token has started; CPU IRQ masking cannot stop SIE. */
+        if(direction) assert(usb_cdc_write(data,64)==64);
+        uint8_t toggle=R8_UEP3_CTRL&(direction?RB_UEP_T_TOG:RB_UEP_R_TOG);
+        assert(!usb_cdc_discard_pending() && cdc_discarding);
+        assert((R8_UEP3_CTRL&MASK_UEP_T_RES)==UEP_T_RES_NAK);
+        assert((R8_UEP3_CTRL&MASK_UEP_R_RES)==UEP_R_RES_NAK);
+        assert(!usb_cdc_read(data,64) && !usb_cdc_write(data,1));
+        if(direction) {
+            assert(cdc_tx_busy==1 && R8_UEP3_T_LEN==64);
+            event(UIS_TOKEN_IN,3,0,0); /* ACK already accepted before NAK. */
+        } else {
+            memset(ep3_buffer,0x5a,64);event(UIS_TOKEN_OUT,3,64,RB_UIS_TOG_OK);
+        }
+        assert((R8_UEP3_CTRL&(direction?RB_UEP_T_TOG:RB_UEP_R_TOG))!=toggle);
+        assert(!usb_cdc_discard_pending()); /* Still not hardware free. */
+        R8_USB_MIS_ST=RB_UMS_SIE_FREE;assert(usb_cdc_discard_pending());
+        assert(!cdc_discarding && !cdc_tx_busy && !cdc_rx_length && !R8_UEP3_T_LEN);
+        assert((R8_UEP3_CTRL&(direction?RB_UEP_T_TOG:RB_UEP_R_TOG))!=toggle);
+        assert(usb_cdc_write(data,1)==1);event(UIS_TOKEN_IN,3,0,0);assert(!cdc_tx_busy);
+    }
+}
 static void test_composite(void);
 int main(void)
 {
@@ -252,7 +302,7 @@ int main(void)
     assert(usb_dap_take_request(out, &length) && length == 4 && out[0] == 0x5a);
     usb_dap_discard_request();
     test_composite();
-    test_set_interface_isolation();
+    test_set_interface_isolation();test_cdc_recovery_discard();test_cdc_discard_inflight_completion();
 #if WD_USB_POLLING
     puts("USB polling tests passed: HID/Bulk routing, Bulk+CDC interleaving/ZLP/toggles/backpressure, descriptors and lifecycle");
 #else

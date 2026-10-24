@@ -60,6 +60,10 @@ bool link_slave_handle(struct link_slave *s, const uint8_t request[RADIO_FRAME_S
             if (reset) reset();
         }
         out.type = LINK_HELLO_ACK; out.session = s->session; out.sequence = p.sequence;
+        /* A restarted host may reuse a nonce. Preserve the cache for genuine
+         * HELLO retries, but tell it that this session has already executed data.
+         * It must choose a fresh nonce before sending any new payload. */
+        if (s->have_cache) { out.length = 1; out.data[0] = 1; }
         return link_encode(&out, response);
     }
     if (p.type != LINK_REQUEST || !p.length || !s->connected || p.session != s->session)

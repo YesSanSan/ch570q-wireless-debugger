@@ -619,8 +619,15 @@ def main():
         if args.port:
             uart = serial.Serial(port=None, baudrate=115200, timeout=0.05)
             uart.port = args.port
-            uart.dtr = True
+            # 1.3.3 quarantines CDC whenever the DAP session generation changes,
+            # which claiming the Bulk interface does, and only releases it after
+            # observing DTR low. Open unasserted, let the device see that, then
+            # raise DTR like a debugger session does; without this the CDC run
+            # would silently measure a link with no CDC traffic at all.
+            uart.dtr = False
             uart.open()
+            time.sleep(0.25)
+            uart.dtr = True
             reader = threading.Thread(target=cdc_reader, args=(uart,), daemon=True)
             reader.start()
             if args.cdc_write_rate > 0:

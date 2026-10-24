@@ -11,6 +11,8 @@ static bool configured=true, pending_usb, pending_rf, allow_response=true;
 static uint8_t usb_req[64], rf_rx[78], rf_tx[78], usb_reply[64];
 static unsigned sends, replies, executions;
 void radio_init(void) {}
+void radio_poll(uint32_t now) { (void)now; }
+uint32_t platform_millis(void) { return 0; }
 bool radio_send(const uint8_t p[RADIO_FRAME_SIZE]) { memcpy(rf_tx,p,78);++sends;return true; }
 bool radio_receive(uint8_t p[RADIO_FRAME_SIZE]) { if(!pending_rf)return false;memcpy(p,rf_rx,78);pending_rf=false;return true; }
 void usb_dap_init(void) {}

@@ -77,7 +77,7 @@ def main():
     parser.add_argument('--serial')
     parser.add_argument('--remote', action='store_true', help='Address the selected RF slave')
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('info', 'stats', 'uart-stats', 'get-config', 'save', 'apply'):
+    for name in ('info', 'stats', 'uart-stats', 'recovery-stats', 'reconnect', 'get-config', 'save', 'apply'):
         commands.add_parser(name)
     commands.add_parser('discover')
     pair = commands.add_parser('pair')
@@ -92,7 +92,7 @@ def main():
     config.add_argument('--save', action='store_true')
     config.add_argument('--apply', action='store_true')
     args = parser.parse_args()
-    if args.remote and args.command in ('discover', 'pair'):
+    if args.remote and args.command in ('discover', 'pair', 'reconnect'):
         parser.error('This command is local only')
     if args.command == 'configure' and args.idle_ms is not None and not 0 <= args.idle_ms <= 60000:
         parser.error('--idle-ms must be 0..60000')
@@ -104,6 +104,18 @@ def main():
             result = {'api_version': r[3], 'active_role': r[4], 'configured_role': r[5],
                       'id_valid': bool(r[6]),
                       'id': r[8:16].hex(), 'persistence': bool(r[16]), 'fault_locked': bool(r[17])}
+        elif args.command == 'reconnect':
+            call(13)
+            result = {'status': 'ready_for_new_connection', 'old_request_replayed': False,
+                      'note': 'Local session reset only; reconnect the debugger to handshake and initialize the target.'}
+        elif args.command == 'recovery-stats':
+            r = call(14)
+            if r[3] != 1:
+                raise ValueError(f'Unsupported recovery stats version: {r[3]}')
+            names = ['rx_timeouts', 'tx_watchdogs', 'recovery_attempts', 'recovery_failures',
+                     'recoveries', 'stale_events', 'reconnects', 'response_expirations']
+            result = dict(zip(names, struct.unpack_from('<8I', r, 6)))
+            result.update(version=r[3], fault_locked=bool(r[4]), cdc_quarantined=bool(r[5]))
         elif args.command in ('stats', 'uart-stats'):
             uart = args.command == 'uart-stats'
             r = call(12 if uart else 1)

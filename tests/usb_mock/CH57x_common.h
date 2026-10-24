@@ -67,6 +67,7 @@ static uint32_t mock_irq_enabled = 1;
 /* 0x30 = idle, not SETUP. SETUP_ACT is independent of retained token/EP. */
 #define UIS_TOKEN_SETUP 0x30
 #define RB_UMS_SUSPEND 4
+#define RB_UMS_SIE_FREE 0x20
 #define RB_UDP_PU_EN 0x1000
 #define RB_PIN_USB_EN 0x2000
 #define RB_PIN_DEBUG_EN 0x4000

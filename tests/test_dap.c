@@ -141,7 +141,7 @@ int main(void){
     q[0]=0;q[1]=0xf0;assert(run(q,2)==3 && out[1]==1 && out[2]==1);
     q[1]=0xfe;assert(run(q,2)==3 && out[2]==1);
     q[1]=0xff;assert(run(q,2)==4 && out[2]==64 && out[3]==0);
-    q[1]=4;assert(run(q,2)==8 && out[1]==6 && memcmp(out+2,"1.3.2",6)==0);
+    q[1]=4;assert(run(q,2)==8 && out[1]==6 && memcmp(out+2,"1.3.3",6)==0);
     q[0]=0x0a;assert(run(q,1)==3 && out[1]==255 && out[2]==0);
     q[0]=2;q[1]=2;assert(run(q,2)==2 && out[1]==0);
     q[1]=1;assert(run(q,2)==2 && out[1]==1);

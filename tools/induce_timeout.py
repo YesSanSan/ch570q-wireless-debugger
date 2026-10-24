@@ -17,10 +17,11 @@ what makes this test non-destructive: no re-enumeration is needed afterwards.
 A phase-2 timeout would need the peer to stop answering with the session intact
 (peer reboot, peer APPLY or a foreign HELLO), which cannot be driven from here.
 
-Expected reply shapes @ 0x08 = DAP_TRANSFER_PROTOCOL_ERROR:
-    DAP_TransferBlock 0x06 -> 06 00 08      (was 06 00 00 08: false OK)
-    DAP_SWD_Sequence  0x1d -> 1d 00 08      (was 1d ff: two bytes only)
+Expected reply shapes for firmware 1.3.3 (CMSIS-DAP command layouts):
+    DAP_TransferBlock 0x06 -> 06 00 00 08  (LE16 zero count, protocol error)
+    DAP_SWD_Sequence  0x1d -> 1d ff        (DAP_ERROR status)
     DAP_Transfer      0x05 -> 05 00 08
+The earlier 1.3.2 test incorrectly treated the first two valid layouts as bugs.
 
 Usage:
     python tools/induce_timeout.py --output build/induced-timeout.json
@@ -42,13 +43,13 @@ CMD_LOCAL = 0x80
 CTL_INFO, CTL_STATS, CTL_GET_CONFIG, CTL_SET_CONFIG, CTL_APPLY = 0, 1, 4, 5, 11
 RECORD_SIZE = 32
 EXPECTED = {
-    0x06: bytes((0x06, 0x00, 0x08)),
-    0x1d: bytes((0x1d, 0x00, 0x08)),
+    0x06: bytes((0x06, 0x00, 0x00, 0x08)),
+    0x1d: bytes((0x1d, 0xff)),
     0x05: bytes((0x05, 0x00, 0x08)),
 }
 OLD_SHAPES = {
-    0x06: bytes((0x06, 0x00, 0x00, 0x08)),
-    0x1d: bytes((0x1d, 0xff)),
+    0x06: bytes((0x06, 0x00, 0x08)),
+    0x1d: bytes((0x1d, 0x00, 0x08)),
 }
 
 

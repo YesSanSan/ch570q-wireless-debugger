@@ -23,6 +23,7 @@
 #define RETRY_ATTEMPTS_IN_BUDGET 16u
 #define DISCOVERY_MS 1000u
 #define UART_INTERVAL_MS 10u
+#define RESPONSE_WAIT_MS 100u
 static rf_config_t settings;
 static uint8_t hardware_id[8], peers[4][8], peer_count;
 static bool identity_valid;
@@ -35,7 +36,9 @@ static uint32_t discovery_due, discovery_reply_nonce, discovery_round;
 static uint32_t link_timeouts, link_retries, link_rejected, completed;
 static bool fault, pending_response, discover_active, discover_reply_pending;
 static bool apply_pending;
-static uint32_t apply_after;
+static uint32_t apply_after, response_started;
+static uint32_t reconnects, response_expirations;
+static bool cdc_quarantined, reconnecting;
 static struct link_slave slave;
 static struct retry_state retry;
 static uint8_t cdc_tx[54], cdc_tx_len;
@@ -63,6 +66,12 @@ static uint8_t config_status(rf_config_status_t s) {
 static void stream_reset(void) {
     cdc_tx_len=0; cdc_open=false; previous_uart_enabled=0;
     cdc_rx_head=cdc_rx_tail=cdc_rx_count=0;
+}
+/* End the failed operation; never replay its payload in a new session. CDC
+ * requires a DTR close before it may consume more USB bytes. */
+static void reconnect_link(void) {
+    session=0;sequence=1;fault=false;reconnecting=false;discover_active=false;
+    stream_reset();usb_cdc_discard_pending();cdc_quarantined=true;++reconnects;
 }
 /* RF settings are staged until APPLY (500 ms grace); saved role changes
  * take effect at reboot. ACKs always leave on the previous RF parameters. */
@@ -123,6 +132,20 @@ static size_t control(const uint8_t *p, size_t n, uint8_t *out, size_t cap, bool
         if(cdc_open || bridge.enabled || bridge.enable_pending || fault) out[2]=WD_STATUS_BUSY;
         else {apply_pending=true;apply_after=platform_millis()+500;}
         break;
+    case WD_CTL_RECONNECT:
+        if(!local || role!=RF_CONFIG_ROLE_HOST) out[2]=WD_STATUS_DENIED;
+        else if(usb_cdc_control_line_state()&1) out[2]=WD_STATUS_BUSY;
+        else reconnect_link();
+        break;
+    case WD_CTL_RECOVERY_STATS: {
+        radio_stats_t stats;radio_get_stats(&stats);
+        out[3]=1; /* Versioned separately from the original 12-field stats. */
+        out[4]=fault;out[5]=cdc_quarantined;
+        const uint32_t values[]={stats.rx_timeouts,stats.tx_watchdogs,stats.recovery_attempts,
+            stats.recovery_failures,stats.recoveries,stats.stale_events,reconnects,response_expirations};
+        for(unsigned i=0;i<sizeof(values)/sizeof(values[0]);++i) put32(out+6+4*i,values[i]);
+        return 6+sizeof(values);
+    }
     case WD_CTL_UART_STATS: {
         uart_bridge_snapshot_t state;uart_bridge_get_snapshot(&state);
         const uint32_t values[]={state.rx_received,state.rx_read,state.rx_overflow,state.rx_discarded,
@@ -173,13 +196,9 @@ static void reset_dispatch(void) {
     dap_init();
     /* UART closure is cooperative; no FIFO flush or duplicated target bytes. */
 }
-/* A timed-out request may already have executed, so the reply must not invite a
- * blind replay. It must still have the exact response shape of its command: the
- * host parses the short packet by command, and a malformed one desynchronises
- * it instead of failing it. DAP_TransferBlock used to answer
- * {0x06, count=0, response=0x00} which reads as "OK, zero words transferred",
- * so a host streaming a framebuffer with 0x06 could spin on a false success
- * rather than fail. 0x08 is DAP_TRANSFER_PROTOCOL_ERROR. */
+/* A timed-out request may already have executed. Report a protocol error and
+ * require an explicit Connect/reconnect before any new target operation.
+ * TransferBlock has a 16-bit count; SWD_Sequence has only a status byte. */
 static void fail_request(bool uncertain) {
     memset(response,0,sizeof(response));response_len=2;response[0]=request[0];response[1]=0xff;
     switch(request[0]) {
@@ -187,16 +206,20 @@ static void fail_request(bool uncertain) {
     case 0x02: /* DAP_Connect: report no port connected. */
         response[1]=0;break;
     case 0x05: /* DAP_Transfer: TransferCount 0, TransferResponse error. */
-    case 0x06: /* DAP_TransferBlock: identical shape, never a false OK. */
-    case 0x1d: /* DAP_SWD_Sequence: SequenceCount 0, SequenceResponse error. */
         response[1]=0;response[2]=8;response_len=3;break;
+    case 0x06: /* DAP_TransferBlock: count LE16, then transfer status. */
+        response[1]=response[2]=0;response[3]=8;response_len=4;break;
+    case 0x1d: /* DAP_SWD_Sequence: DAP_ERROR status only. */
+        response[1]=0xff;break;
     case 0x0a: /* DAP_ResetTarget: failed, Execute 0. */
         response[2]=0;response_len=3;break;
     case 0x10: /* DAP_SWJ_Pins: report the pins as unavailable. */
         response[1]=0x80;break;
     default: break;
     }
-    fault|=uncertain;phase=3;
+    fault|=uncertain || reconnecting;reconnecting=false;
+    if(fault) cdc_quarantined=true;
+    phase=3;
 }
 static void queue_request(uint32_t now) {
     struct link_packet p={0};p.type=LINK_REQUEST;p.session=session;p.sequence=sequence;
@@ -206,8 +229,9 @@ static void queue_request(uint32_t now) {
 static void begin_request(uint32_t now) {
     if(session) {queue_request(now);return;}
     struct link_packet p={0};
-    nonce=now ^ (generation*0x9e3779b9u) ^ get32(hardware_id);
-    if(!nonce) nonce=1;
+    /* Monotonic within this boot: even two reconnects in one millisecond must
+     * not reuse the previous HELLO and its cached session. */
+    ++nonce;if(!nonce) ++nonce;
     p.type=LINK_HELLO;p.sequence=nonce;
     if(nonzero(settings.peer_id,8)) {p.length=8;memcpy(p.data,settings.peer_id,8);}
     link_encode(&p,outgoing);phase=1;started=now;last_tx=now-retry.rto;retry_begin(&retry);
@@ -220,11 +244,21 @@ static void host_receive(uint32_t now) {
             p.length==8 && !p.session && nonzero(p.data,8)) {
             unsigned i;for(i=0;i<peer_count;i++) if(!memcmp(peers[i],p.data,8)) break;
             if(i==peer_count && peer_count<4) memcpy(peers[peer_count++],p.data,8);
+        } else if(phase==1 && p.type==LINK_HELLO_ACK && p.sequence==nonce && p.session &&
+            p.length==1 && p.data[0]==1) {
+            /* Peer retained an already-used session across a host restart.
+             * Choose another nonce without extending this HELLO's deadline. */
+            uint32_t deadline_started=started;
+            begin_request(now);started=deadline_started;
         } else if(phase==1 && p.type==LINK_HELLO_ACK && p.sequence==nonce && p.session && !p.length) {
             retry_complete(&retry,now);session=p.session;queue_request(now);
         } else if(phase==2 && p.type==LINK_RESPONSE && p.session==session && p.sequence==sequence &&
             p.length && (p.data[0]==request[0] || p.data[0]==0xff)) {
             retry_complete(&retry,now);response_len=p.length;memcpy(response,p.data,p.length);
+            if(reconnecting) {
+                fault=!(p.length==2 && p.data[0]==0x02 && p.data[1]==1);
+                reconnecting=false;
+            }
             ++completed;++sequence;if(!sequence) {session=0;sequence=1;} phase=3;last_activity=now;
         } else ++link_rejected;
     }
@@ -241,6 +275,12 @@ static void host_discover(uint32_t now) {
 static bool cdc_request(uint32_t now) {
     usb_cdc_get_line_coding(&cdc_line);
     bool opened=(usb_cdc_control_line_state()&1)!=0;
+    if(cdc_quarantined) {
+        if(!opened) {
+            if(usb_cdc_discard_pending()) cdc_quarantined=false;
+        }
+        return false;
+    }
     if(fault || (apply_pending && !cdc_open && !previous_uart_enabled) ||
         (!opened && !cdc_open && !previous_uart_enabled)) return false;
     if(now-last_uart<UART_INTERVAL_MS) return false;
@@ -258,8 +298,9 @@ static void host_poll(uint32_t now) {
     usb_dap_poll();
     uint32_t current=usb_dap_generation();
     if(generation!=current) {
-        generation=current;session=0;sequence=1;phase=0;fault=false;
+        generation=current;session=0;sequence=1;phase=0;fault=reconnecting=false;
         discover_active=false;stream_reset();
+        cdc_quarantined=true;usb_cdc_discard_pending();
     }
     host_receive(now);
     if(!usb_dap_configured()) return;
@@ -277,7 +318,7 @@ static void host_poll(uint32_t now) {
         } else {
             unsigned count=response[3];
             if(count>54 || response_len<4+count || response[2]>cdc_tx_len || count>sizeof(cdc_rx)-cdc_rx_count) {
-                fault=true;usb_cdc_set_serial_state(0x40);phase=0;
+                fault=true;cdc_quarantined=true;usb_cdc_set_serial_state(0x40);phase=0;
             } else {
                 for(unsigned i=0;i<count;i++) {cdc_rx[cdc_rx_head]=response[4+i];cdc_rx_head=(cdc_rx_head+1)%sizeof(cdc_rx);}
                 cdc_rx_count+=count;
@@ -291,13 +332,20 @@ static void host_poll(uint32_t now) {
     if(!phase) {
         uint32_t tag;
         if(usb_dap_take_request_tagged(request,&request_len,&tag)) {
-            if(tag!=generation) {generation=tag;session=0;sequence=1;fault=false;stream_reset();}
+            if(tag!=generation) {
+                generation=tag;session=0;sequence=1;fault=reconnecting=false;stream_reset();
+                cdc_quarantined=true;usb_cdc_discard_pending();
+            }
             owner=0;last_activity=now;
             if(request_len && request[0]==7) usb_dap_discard_request_tagged(tag);
             else if(request_len && request[0]==WD_CMD_LOCAL) {
                 response_len=(uint8_t)control(request,request_len,response,64,true);phase=3;
-            } else if(!request_len || fault || discover_active) fail_request(false);
-            else begin_request(now);
+            } else if(!request_len || discover_active) fail_request(false);
+            else if(fault) {
+                if(request_len>=2 && request[0]==0x02 && request[1]<=1) {
+                    reconnect_link();fault=reconnecting=true;begin_request(now);
+                } else fail_request(false);
+            } else begin_request(now);
         } else if(!discover_active) cdc_request(now);
     }
     host_discover(now);
@@ -330,13 +378,16 @@ static void slave_poll(uint32_t now) {
     uart_bridge_snapshot_t uart_state;uart_bridge_get_snapshot(&uart_state);
     if((uart_state.enabled || uart_state.enable_pending) && now-last_stream>2000 && uart_bridge_disable()) previous_uart_enabled=0;
     if(pending_response) {
-        if(radio_send(outgoing)) pending_response=false;
-        return;
+        if(radio_send(outgoing)) {pending_response=false;return;}
+        if(now-response_started<RESPONSE_WAIT_MS) return;
+        /* Keep link cache/sequence and mailbox intact. A repeated request will
+         * recover the exact response without executing target/UART work twice. */
+        pending_response=false;++response_expirations;
     }
     if(discover_reply_pending && (int32_t)(now-discovery_due)>=0) {
         struct link_packet p={0};p.type=LINK_DISCOVER_REPLY;p.sequence=discovery_reply_nonce;
         p.length=8;memcpy(p.data,hardware_id,8);link_encode(&p,outgoing);
-        pending_response=true;discover_reply_pending=false;return;
+        pending_response=true;response_started=now;discover_reply_pending=false;return;
     }
     if(radio_receive(incoming)) {
         struct link_packet p;
@@ -351,7 +402,7 @@ static void slave_poll(uint32_t now) {
         }
         if(p.type==LINK_HELLO && p.length==8 && (!identity_valid || memcmp(p.data,hardware_id,8))) return;
         if(link_slave_handle(&slave,incoming,outgoing,now^get32(hardware_id),dispatch,reset_dispatch)) {
-            pending_response=true;last_activity=now;++completed;
+            pending_response=true;response_started=platform_millis();last_activity=now;++completed;
         } else ++link_rejected;
     }
 }
@@ -380,6 +431,7 @@ int main(void) {
     rf_config_t saved;
     if(rf_config_load(&saved)==RF_CONFIG_OK) settings=saved;
     identity_valid=radio_get_hardware_id(hardware_id);
+    nonce=platform_millis()^get32(hardware_id); /* Seed once; reconnects only advance it. */
     uart_log_event(UART_LOG_BOOT,0xE1u,(uint32_t)settings.role|((uint32_t)settings.channel<<8)|
         ((uint32_t)identity_valid<<16));log_flush(24);
     role=WD_ROLE_POLICY==RF_CONFIG_ROLE_AUTO?settings.role:WD_ROLE_POLICY;
@@ -402,6 +454,7 @@ int main(void) {
     last_activity=platform_millis();
     for(;;) {
         uint32_t now=platform_millis();
+        radio_poll(now);
         uart_log_poll();
 #if WD_UART_LOG
         { static uint32_t beat; if(now-beat>=1000u) { beat=now; uart_log_event(UART_LOG_HEARTBEAT,role,phase); } }

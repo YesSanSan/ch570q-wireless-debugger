@@ -2,6 +2,7 @@
 #include "link.h"
 #include "uart_log.h"
 #include "board.h"
+#include "platform.h"
 #if WD_ROLE_HOST
 #include "usb_dap.h"
 #else
@@ -158,6 +159,7 @@ int main(void)
     uart_log_event(UART_LOG_RF_INIT, 1, 0);
     uint32_t last_heartbeat = SysTick->CNTL;
     for (;;) {
+        radio_poll(platform_millis());
         uart_log_poll();
         uint32_t now = SysTick->CNTL;
 #if WD_ROLE_HOST

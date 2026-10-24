@@ -113,6 +113,7 @@ static uint16_t control_remaining;
 static const uint8_t *control_data;
 static usb_dap_transport_t transport;
 static uint8_t cdc_rx_length, cdc_rx_offset, cdc_tx_busy, cdc_tx_length;
+static uint8_t cdc_discarding, cdc_cancel_in, cdc_cancel_out;
 static uint8_t cdc_control, notify_busy;
 static uint16_t cdc_break, serial_state, notified_state;
 static uint8_t line_coding[7], pending_line_coding[7];
@@ -183,9 +184,9 @@ static void cdc_update(void)
 {
     R8_UEP3_CTRL = (R8_UEP3_CTRL & (RB_UEP_R_TOG | RB_UEP_T_TOG)) |
         (halted(3, false) ? UEP_R_RES_STALL :
-         (configuration && !cdc_rx_length ? UEP_R_RES_ACK : UEP_R_RES_NAK)) |
+         (configuration && !cdc_discarding && !cdc_rx_length ? UEP_R_RES_ACK : UEP_R_RES_NAK)) |
         (halted(3, true) ? UEP_T_RES_STALL :
-         (configuration && cdc_tx_busy ? UEP_T_RES_ACK : UEP_T_RES_NAK));
+         (configuration && !cdc_discarding && cdc_tx_busy ? UEP_T_RES_ACK : UEP_T_RES_NAK));
     notify_update();
 }
 static void dap_reset(void)
@@ -212,6 +213,7 @@ static void cdc_control_reset(void)
 static void cdc_data_reset(void)
 {
     cdc_rx_length = cdc_rx_offset = cdc_tx_busy = cdc_tx_length = 0;
+    cdc_discarding = cdc_cancel_in = cdc_cancel_out = 0;
     R8_UEP3_T_LEN = 0;
 }
 static void cdc_reset(void)
@@ -583,12 +585,15 @@ static void usb_service(void)
                 }
             } else if (endpoint == 3) {
                 if (token == UIS_TOKEN_OUT && (status & RB_UIS_TOG_OK) &&
-                    (R8_UEP3_CTRL & MASK_UEP_R_RES) == UEP_R_RES_ACK && configuration) {
+                    ((R8_UEP3_CTRL & MASK_UEP_R_RES) == UEP_R_RES_ACK ||
+                     (cdc_discarding && cdc_cancel_out)) && configuration) {
                     uint8_t n = R8_USB_RX_LEN;
-                    R8_UEP3_CTRL ^= RB_UEP_R_TOG;
+                    R8_UEP3_CTRL ^= RB_UEP_R_TOG;cdc_cancel_out=0;
                     if (n <= REPORT_SIZE && !cdc_rx_length) { cdc_rx_length = n; cdc_rx_offset = 0; }
-                } else if (token == UIS_TOKEN_IN && (R8_UEP3_CTRL & MASK_UEP_T_RES) == UEP_T_RES_ACK) {
-                    R8_UEP3_CTRL ^= RB_UEP_T_TOG;
+                } else if (token == UIS_TOKEN_IN &&
+                           ((R8_UEP3_CTRL & MASK_UEP_T_RES) == UEP_T_RES_ACK ||
+                            (cdc_discarding && cdc_cancel_in))) {
+                    R8_UEP3_CTRL ^= RB_UEP_T_TOG;cdc_cancel_in=0;
                     if (cdc_tx_busy == 1 && cdc_tx_length == REPORT_SIZE) cdc_tx_busy = 2;
                     else cdc_tx_busy = 0;
                     R8_UEP3_T_LEN = 0;
@@ -758,7 +763,7 @@ uint16_t usb_cdc_read(uint8_t *data, uint16_t capacity)
     uint32_t irq; uint16_t n = 0;
     if (!data || !capacity) return 0;
     irq = usb_lock(); usb_service();
-    if (configuration && !suspended && !halted(3, false)) {
+    if (configuration && !suspended && !halted(3, false) && !cdc_discarding) {
         n = cdc_rx_length - cdc_rx_offset;
         if (n > capacity) n = capacity;
         if (n) memcpy(data, ep3_buffer + cdc_rx_offset, n);
@@ -773,13 +778,29 @@ uint16_t usb_cdc_write(const uint8_t *data, uint16_t length)
     uint32_t irq; uint16_t n = 0;
     if (!data || !length) return 0;
     irq = usb_lock(); usb_service();
-    if (configuration && !suspended && !halted(3, true) && !cdc_tx_busy) {
+    if (configuration && !suspended && !halted(3, true) && !cdc_tx_busy && !cdc_discarding) {
         n = length > REPORT_SIZE ? REPORT_SIZE : length;
         memcpy(ep3_buffer + REPORT_SIZE, data, n);
         cdc_tx_busy = 1; cdc_tx_length = (uint8_t)n; R8_UEP3_T_LEN = (uint8_t)n;
         cdc_update();
     }
     usb_unlock(irq); return n;
+}
+bool usb_cdc_discard_pending(void)
+{
+    uint32_t irq = usb_lock(); usb_service();
+    if (!cdc_discarding) {
+        /* IRQ masking does not stop SIE: retain permission to finish a token
+         * accepted before NAK, including its toggle, until SIE is observed free. */
+        cdc_cancel_in=(R8_UEP3_CTRL & MASK_UEP_T_RES)==UEP_T_RES_ACK;
+        cdc_cancel_out=(R8_UEP3_CTRL & MASK_UEP_R_RES)==UEP_R_RES_ACK;
+        cdc_discarding=1;cdc_update();
+    }
+    usb_service();
+    bool done=!configuration || ((R8_USB_MIS_ST & RB_UMS_SIE_FREE) &&
+                                !(R8_USB_INT_FG & RB_UIF_TRANSFER));
+    if (done) {cdc_data_reset();cdc_update();}
+    usb_unlock(irq);return done;
 }
 void usb_cdc_get_line_coding(usb_cdc_line_coding_t *coding)
 {
