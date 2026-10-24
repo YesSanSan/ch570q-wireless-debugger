@@ -48,6 +48,7 @@ if g_frame_count <= $paused_frame || g_oled_ready != 1 || g_i2c_errors != 0 || g
 end
 dump binary memory examples/ks2-oled/build/oled-framebuffer.bin g_oled_buffer g_oled_buffer+1024
 set var g_frame_delay_ms=50
+monitor resume
 echo HARDWARE_VALIDATION_PASS\n
 detach
 quit

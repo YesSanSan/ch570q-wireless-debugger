@@ -45,7 +45,7 @@ python tools/capture_uart.py --port COM13 --dtr --baud 115200 --seconds 30 --out
 - 没有 NRST，不能使用硬件复位或 connect-under-reset。Cortex-M 软件复位依赖目标 MEM-AP 可访问。
 - SWJ 时钟接受 100 kHz–1 MHz 请求值，实际 GPIO 频率仍待标定。默认从 100 kHz 开始。
 
-固件 1.3.1 将正常物理 SWD 操作与额外重试预算分离，正常操作最多 48 次、额外 WAIT/匹配重试最多 32 次。模型验证合法 64 字节报文不会再因旧 32 次预算被截断；真实 WAIT/FAULT 仍可能造成部分完成。该版本直连上板验证尚未完成。
+固件 1.3.1 将正常物理 SWD 操作与额外重试预算分离，正常操作最多 48 次、额外 WAIT/匹配重试最多 32 次。模型验证合法 64 字节报文不会再因旧 32 次预算被截断；真实 WAIT/FAULT 仍可能造成部分完成。HID / Bulk 分别直连已通过下述上板测试；Bulk 与 CDC 并发仍有已复现的故障。
 
 旧 1.3.0 从机可使用保留的 32 字节兼容桥。在一个终端运行：
 
@@ -60,6 +60,28 @@ openocd -f config/openocd-budget.cfg -f target/stm32f1x.cfg -c "cortex_m reset_c
 ```
 
 `tools/run_openocd.py` 为旧桥配套启动器；OLED 验证工具支持 `--legacy`。更新后的默认入口使用普通 OpenOCD HID。
+
+## 上板验证（2026-10-24）
+
+现场从机的 DAP 固件版本返回 `1.3.1`。测试使用 OpenOCD 0.12.0+dev-02554、STM32F103C8T6 和本仓库 OLED 示例，不使用 32 字节兼容桥。
+
+| 测试 | 结果 |
+| --- | --- |
+| 原生回归 | 13 组全部通过，含 59 组 SWD GPIO 用例 |
+| HID / RF 身份 | 64 B 报文、单包额度和版本检查通过 |
+| SWD IDCODE | 100 / 500 / 1000 kHz 请求值各读两次，均为 `0x1BA01477`；不是物理频率测量 |
+| HID、Bulk 分别直连 | Cortex-M3、device ID `0x20036410`、64 KiB Flash 识别通过；已有 OLED Flash 与本地 ELF 校验通过 |
+| HID、Bulk 分别运行控制 | main / oled_update 硬件断点、单步、暂停恢复、RAM 参数读写和 1 KiB 帧缓冲读取通过 |
+| CDC 单独运行 | 115200 8N1 连续接收 5 条心跳；一次详细采集 285 B，RX 收取与交付均为 285 B、队列溢出 0 |
+| Bulk + CDC 并发 | 两次复现请求超时；GDB 在帧缓冲读取后的参数恢复写入处显式失败，首个异常事务尚未定位 |
+
+并发失败后，主机故障锁定会连带拒绝后续 DAP 和远端管理，并停止 CDC；远端管理看到的 `81ff` 可能是主机合成的失败响应，不能据此判断从机死机。后一次只拔插主机 USB 即恢复远端通信。建议暂时分开使用调试与无线串口。
+
+CDC 初次启用时曾记录 8 B 丢弃和一次硬件 overrun，与启用前 FIFO 积压相符；后续接收未增加队列溢出。此结果不等于持续高吞吐无损验证。验证结束已恢复目标运行；最终 5 秒采集收到 275 B，frames 从 16 增至 40，ready=1、i2c_errors=0、fault=0。
+
+本轮没有烧写 CH570Q、没有擦写 STM32 Flash，也没有复测配置持久化或长时间干扰稳定性；设备版本通过协议读取，未对 CH570Q Flash 做逐字节回读比对。
+
+详细日志和 JSON 保存在本机 `build/validation-*`，由 Git 忽略：`validation-hid.json`、`validation-swd.json`、`validation-hid-final-gdb.log`、`validation-bulk-gdb.log`、`validation-bulk-cdc-retest-openocd.log`、`validation-cdc-state.json`、`validation-final-uart.log`。重建或清理构建目录前如需保留证据，应另行备份。
 
 ## 诊断与测试工具
 

@@ -30,7 +30,7 @@ openocd -f ch570q.cfg -c "program build/ks2-oled.elf verify reset exit"
 
 VS Code 直接打开本目录，安装推荐扩展：`Ctrl+Shift+B` 构建，任务 `flash` 下载并校验，`debug-server` 启动 OpenOCD，随后 F5 连接。`verify-hardware` 自动执行 GDB 验证，会复位和控制目标；不可与其他 OpenOCD 实例同时运行。
 
-默认配置使用标准 CMSIS-DAP HID，要求 CH570Q 从机更新至 1.3.1；该版本已通过编译与模型测试，直连上板验证尚未完成。历史 1.3.0 使用 32 字节兼容桥已验证下载、Flash 校验、断点、单步及 UART。旧设备入口见项目根目录的 [使用说明](../../docs/usage.md)。
+默认配置使用标准 CMSIS-DAP HID，要求 CH570Q 从机更新至 1.3.1。2026-10-24 已通过 HID / Bulk 分别直连的现有 Flash 校验、断点、单步、暂停恢复和帧缓冲读取；测试脚本在成功结束前显式恢复目标运行。CDC 单独运行收到连续心跳，但 Bulk 与 CDC 并发两次出现请求超时，目前建议分开使用。历史 1.3.0 使用 32 字节兼容桥已验证下载，本轮没有擦写目标 Flash。详细边界和旧设备入口见 [使用说明](../../docs/usage.md)。
 
 ## 运行与观察
 
