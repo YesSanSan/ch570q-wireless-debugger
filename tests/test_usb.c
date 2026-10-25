@@ -134,6 +134,7 @@ static void test_cdc_discard_inflight_completion(void)
         assert(usb_cdc_write(data,1)==1);event(UIS_TOKEN_IN,3,0,0);assert(!cdc_tx_busy);
     }
 }
+#include "usb_recovery_cases.h"
 static void test_composite(void);
 int main(void)
 {
@@ -303,6 +304,7 @@ int main(void)
     usb_dap_discard_request();
     test_composite();
     test_set_interface_isolation();test_cdc_recovery_discard();test_cdc_discard_inflight_completion();
+    test_ep0_recovery();
 #if WD_USB_POLLING
     puts("USB polling tests passed: HID/Bulk routing, Bulk+CDC interleaving/ZLP/toggles/backpressure, descriptors and lifecycle");
 #else

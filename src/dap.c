@@ -40,7 +40,7 @@ static size_t info(uint8_t id,uint8_t *o) {
     switch(id) {
     case 1:s="WCH";break; case 2:s="CH570Q Wireless ARM DAP";break;
     /* Version is returned by the slave; update both boards for recovery support. */
-    case 3:s="CH570Q-0001";break; case 4:s="1.3.3";break;
+    case 3:s="CH570Q-0001";break; case 4:s="1.3.4";break;
     case 0xf0:o[1]=1;o[2]=1;return 3; /* SWD only; no SWO/JTAG/timestamp */
     case 0xfe:o[1]=1;o[2]=1;return 3;
     case 0xff:o[1]=2;o[2]=64;o[3]=0;return 4;

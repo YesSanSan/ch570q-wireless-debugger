@@ -10,7 +10,7 @@
 
 static void reset_app(void)
 {
-    mock_now=100;mock_generation=mock_request_tag=1;mock_response_tag=0;
+    mock_now=100;mock_generation=mock_request_tag=1;mock_response_tag=mock_cleanup_generation=0;
     mock_usb_configured=true;mock_dtr=false;mock_usb_tx_busy=false;
     mock_line=(usb_cdc_line_coding_t){115200,0,0,8};
     mock_usb_rx_len=mock_usb_rx_pos=mock_usb_tx_len=0;
@@ -398,6 +398,28 @@ static void test_failed_reconnect_keeps_fault(void)
     reset_app();mock_dtr=false;memset(mock_usb_rx,'Q',10);mock_usb_rx_len=10;
     mock_generation=2;step(10);assert(mock_usb_rx_pos==10); /* No app stream state, but EP3 had data. */
 }
+static void test_usb_recovery_ack_discards_old_work(void)
+{
+    for(unsigned old_phase=1;old_phase<=3;++old_phase) {
+        reset_app();mock_dtr=true;if(old_phase==1) session=0;
+        dap_request(0x05);step(10);
+        assert(phase==(old_phase==1?1:2) && mock_cleanup_generation==1);
+        struct link_packet old=last_packet(),reply={0};
+        reply.type=old_phase==1?LINK_HELLO_ACK:LINK_RESPONSE;
+        reply.session=old_phase==1?0x1234:old.session;reply.sequence=old.sequence;
+        if(old_phase!=1) {reply.length=2;reply.data[0]=0x05;reply.data[1]=1;}
+        if(old_phase==3) {phase=3;response_len=2;response[0]=0x05;response[1]=1;}
+        cdc_tx_len=3;memcpy(cdc_tx,"old",3);
+        mock_usb_rx_len=10;memset(mock_usb_rx,'S',10);
+        queue_packet(&reply);unsigned sends=mock_rf_tx_count;
+        ++mock_generation;step(11); /* EP0 reset has advanced USB generation. */
+        assert(mock_cleanup_generation==2 && !session && !phase && !fault);
+        assert(cdc_quarantined && !cdc_tx_len && mock_usb_rx_pos==10);
+        assert(!mock_dap_response_len && mock_rf_tx_count==sends && link_rejected==1);
+        dap_request(0x02);mock_dap_request[1]=1;step(12);
+        assert(last_packet().type==LINK_HELLO && mock_cleanup_generation==2);
+    }
+}
 int main(void)
 {
     test_real_main_startup();test_shared_dap_cdc_sequence();
@@ -409,7 +431,7 @@ int main(void)
     test_explicit_reconnect_after_unknown_write();test_reconnect_control_and_cdc_quarantine();
     test_slave_response_expiry_keeps_cached_write();
     test_host_restart_nonce_collision();test_generation_discards_unread_usb_suffix();
-    test_failed_reconnect_keeps_fault();
+    test_failed_reconnect_keeps_fault();test_usb_recovery_ack_discards_old_work();
     puts("App tests passed: real startup, shared DAP/CDC sequence, cached UART replies, partial TX, DTR drain, RX backpressure, invalid coding, timeout lock, timeout reply shapes, retry budget, generation isolation");
     return 0;
 }

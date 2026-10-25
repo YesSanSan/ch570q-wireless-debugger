@@ -38,6 +38,8 @@ python tools/capture_uart.py --port COM13 --dtr --baud 115200 --seconds 30 --out
 
 ## 连接与故障恢复
 
+**1.3.4 新增 EP0 入口（[实板复测](v134-hardware-validation.md)已验证 Bulk 阻塞恢复）：**如果客户端异常退出后普通 HID/Bulk 管理命令无法送入，先关闭所有调试客户端与 CDC，用 `python tools/debugger_ctl.py usb-status` 保留现场，再执行一次 `python tools/debugger_ctl.py usb-recover`。工具通过 WinUSB interface 1 的控制传输绕过 DAP 请求槽，确认专用计数与前台清理代次；不重放旧目标请求。成功只代表本地会话已清理，不证明远端可用，也不解除 HALT/suspend。然后重新连接调试软件，CDC 按 DTR 低→高重开。环境、失败处理与硬件验收见 [USB 会话恢复](usb-recovery.md)。
+
 **1.3.3 实现边界：**已加入射频看护和显式重连，原生测试及构建通过，并已于 2026-10-25 完成上板复测（结果见 [1.3.3 上板验收](v133-hardware-validation.md)）。遇到错误后先关闭 CDC 串口与 OpenOCD，再重新启动调试连接（合法 `DAP_Connect` 会建立新会话）；或执行 `python tools/debugger_ctl.py reconnect` 清理本地主机会话，再连接目标。可用 `python tools/debugger_ctl.py recovery-stats` 查看恢复计数。管理重连成功不表示远端已连通，旧请求不会重放。CDC 必须关闭 DTR 后重开——1.3.3 在每次 DAP 会话换代后隔离 CDC，只把 DTR 拉低一次才解除，直接以 DTR 高打开会收不到任何字节。完整行为及正确超时响应见 [1.3.3 重连实现](reconnection.md)。以下静默和烧录失败描述是 **1.3.2 的实测记录**；1.3.3 上板复测没有复现它们。
 - 首次上板使用固定主机/从机镜像，检查供电、共地、晶振及 ISP 恢复入口。
 - 先读取 DAP Info 和目标 DP IDCODE，再执行内存访问、下载及运行控制。

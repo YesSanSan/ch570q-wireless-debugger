@@ -1,4 +1,4 @@
-# Run from any directory; requires native Windows GCC (not the RISC-V compiler).
+# Run from any directory; requires native Windows GCC and Python 3.
 $ErrorActionPreference = 'Stop'
 Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
@@ -62,7 +62,9 @@ try {
     if ($LASTEXITCODE) { throw 'Compile unified app tests failed' }
     & ./build/native/test_app.exe
     if ($LASTEXITCODE) { throw 'Unified app tests failed' }
-    Write-Output 'All native suites passed, including composite USB, UART IRQ bridge, adaptive retry, persistence, platform and SWD.'
+    python -B -m unittest discover -s tests -p test_debugger_ctl.py
+    if ($LASTEXITCODE) { throw 'EP0 management tool tests failed' }
+    Write-Output 'All native suites and EP0 management tool tests passed.'
 } finally {
     Pop-Location
 }

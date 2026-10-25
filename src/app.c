@@ -302,6 +302,7 @@ static void host_poll(uint32_t now) {
         discover_active=false;stream_reset();
         cdc_quarantined=true;usb_cdc_discard_pending();
     }
+    usb_dap_ack_generation(generation);
     host_receive(now);
     if(!usb_dap_configured()) return;
     if(cdc_rx_count) {
@@ -335,6 +336,7 @@ static void host_poll(uint32_t now) {
             if(tag!=generation) {
                 generation=tag;session=0;sequence=1;fault=reconnecting=false;stream_reset();
                 cdc_quarantined=true;usb_cdc_discard_pending();
+                usb_dap_ack_generation(generation);
             }
             owner=0;last_activity=now;
             if(request_len && request[0]==7) usb_dap_discard_request_tagged(tag);

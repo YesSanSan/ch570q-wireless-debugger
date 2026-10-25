@@ -48,16 +48,19 @@ int main(void)
         uart_log_poll();
         if (++loops % 100000u == 0) uart_log_event(UART_LOG_HEARTBEAT, loops, usb_diag_requests);
         usb_dap_poll();
-        if (pending && usb_dap_generation() != tag) pending = 0;
+        uint32_t current = usb_dap_generation();
+        if (pending && current != tag) pending = 0;
+        usb_dap_ack_generation(current);
         if (!pending && usb_dap_take_request_tagged(request, &length, &tag)) {
+            usb_dap_ack_generation(tag);
             ++usb_diag_requests;
             if (length && request[0] == 7) {
-                usb_dap_discard_request();
+                usb_dap_discard_request_tagged(tag);
             } else {
                 length = process(length);
                 pending = 1;
             }
         }
-        if (pending && usb_dap_send_response(response, length)) pending = 0;
+        if (pending && usb_dap_send_response_tagged(response, length, tag)) pending = 0;
     }
 }

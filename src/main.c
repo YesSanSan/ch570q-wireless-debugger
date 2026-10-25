@@ -68,6 +68,7 @@ static void host_poll(uint32_t now)
         generation = current_generation;
         phase = 0; session = 0; sequence = 1; fault = false;
     }
+    usb_dap_ack_generation(generation);
     while (radio_receive(incoming)) {
         struct link_packet received;
         if (!link_decode(incoming, &received)) { ++link_rejected; continue; }
@@ -92,10 +93,11 @@ static void host_poll(uint32_t now)
             generation = request_generation;
             session = 0; sequence = 1; fault = false;
         }
+        usb_dap_ack_generation(generation);
         if (request_length && request[0] == 0x07) {
             /* CMSIS-DAP TransferAbort has no response. The one-credit transport
              * cannot preempt an active command; physical retries are bounded. */
-            usb_dap_discard_request();
+            usb_dap_discard_request_tagged(generation);
             return;
         }
         if (!request_length || fault) {
@@ -123,7 +125,7 @@ static void host_poll(uint32_t now)
             ++link_retries;
         }
     }
-    if (phase == 3 && usb_dap_send_response(reply, reply_length)) phase = 0;
+    if (phase == 3 && usb_dap_send_response_tagged(reply, reply_length, generation)) phase = 0;
 }
 #else
 static struct link_slave slave;

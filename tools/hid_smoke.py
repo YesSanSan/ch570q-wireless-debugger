@@ -17,8 +17,8 @@ def main():
                       help='Require the full firmware identity returned by the RF slave')
     parser.add_argument('--timeout-ms', type=int, default=3000,
                         help='HID read timeout; allow the firmware 1.5 s RF timeout to finish')
-    parser.add_argument('--expect-firmware', default='1.3.3',
-                        help='Required RF slave version with --expect-wireless (default 1.3.3)')
+    parser.add_argument('--expect-firmware', default='1.3.4',
+                        help='Required RF slave version with --expect-wireless (default 1.3.4)')
     args = parser.parse_args()
     if args.timeout_ms <= 0:
         parser.error('--timeout-ms must be positive')

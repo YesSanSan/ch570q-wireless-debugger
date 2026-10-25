@@ -46,6 +46,10 @@ void usb_dap_poll(void) {}
 bool usb_dap_bus_seen(void) { return true; }
 bool usb_dap_configured(void) { return mock_usb_configured; }
 uint32_t usb_dap_generation(void) { return mock_generation; }
+static uint32_t mock_cleanup_generation;
+void usb_dap_ack_generation(uint32_t tag) {
+    if(tag==mock_generation) mock_cleanup_generation=tag;
+}
 bool usb_dap_take_request_tagged(uint8_t out[64],uint8_t *length,uint32_t *tag) {
     if(!mock_dap_request_len) return false;
     memcpy(out,mock_dap_request,mock_dap_request_len);

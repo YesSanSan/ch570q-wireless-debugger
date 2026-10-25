@@ -14,6 +14,131 @@ import zlib
 STATUS = {0: 'OK', 1: 'invalid', 2: 'busy', 3: 'unsupported', 4: 'I/O error', 5: 'denied'}
 ROLES = {'auto': 0, 'host': 1, 'slave': 2}
 
+USB_REQUEST = 0x52
+USB_INTERFACE = 1
+USB_STATUS_SIZE = 24
+USB_RECOVERY_SECONDS = 2.0
+
+
+def decode_usb_status(raw):
+    raw = bytes(raw)
+    if (len(raw) != USB_STATUS_SIZE or raw[:4] != b'WUSB' or raw[4] != 1
+            or raw[5] > 5 or raw[6] > 2 or raw[8] > 1 or raw[11] != 0):
+        raise ValueError('Malformed or unsupported USB management status (expected WUSB version 1, 24 bytes)')
+    generation, resets, cleanup = struct.unpack_from('<III', raw, 12)
+    return {'version': raw[4], 'dap_request_state': raw[5], 'transport': raw[6],
+            'config': raw[7], 'suspended': bool(raw[8]), 'halt_in': raw[9],
+            'halt_out': raw[10], 'generation': generation,
+            'usb_reset_counter': resets, 'cleanup_generation': cleanup}
+
+
+def usb_error_message(error):
+    code = getattr(error, 'backend_error_code', None)
+    number = getattr(error, 'errno', None)
+    if code == -9 or number == 32:
+        return 'USB management request stalled (PIPE); firmware may not support EP0 management version 1'
+    if code == -3 or number in (1, 13):
+        return 'USB access denied; stop debugger/CDC clients and check permissions and the WinUSB driver on interface 1'
+    return f'USB management failed: {error}; check WinUSB interface 1 and stop debugger/CDC clients'
+
+
+def usb_management(command, serial=None):
+    """Use only vendor EP0 requests; never configure, reset, or send target DAP traffic."""
+    try:
+        import usb.core
+        import usb.util
+    except ImportError as error:
+        raise RuntimeError('USB management requires PyUSB (install with: python -m pip install pyusb)') from error
+
+    devices = []
+    selected = None
+    claimed = False
+    result = None
+    try:
+        devices = list(usb.core.find(find_all=True, idVendor=0x1209, idProduct=0x0001))
+        candidates = devices
+        if serial is not None:
+            candidates = [device for device in devices if device.serial_number == serial]
+        if len(candidates) != 1:
+            raise RuntimeError(f'Expected one debugger USB device; found {len(candidates)}. '
+                               'Disconnect extra devices; placeholder USB serials cannot distinguish them.')
+        selected = candidates[0]
+        usb.util.claim_interface(selected, USB_INTERFACE)
+        claimed = True
+
+        def status(timeout=500):
+            return decode_usb_status(selected.ctrl_transfer(
+                0xc1, USB_REQUEST, 0, USB_INTERFACE, USB_STATUS_SIZE, timeout=timeout))
+
+        before = status()
+        if command == 'usb-status':
+            result = before
+            return result
+        timed_out = False
+        try:
+            selected.ctrl_transfer(0x41, USB_REQUEST, 0x5253, USB_INTERFACE, b'', timeout=500)
+        except usb.core.USBError as error:
+            if (isinstance(error, usb.core.USBTimeoutError)
+                    or getattr(error, 'errno', None) in (60, 110)
+                    or getattr(error, 'backend_error_code', None) == -7):
+                timed_out = True
+            else:
+                raise
+        expected = (before['usb_reset_counter'] + 1) & 0xffffffff
+        deadline = time.monotonic() + USB_RECOVERY_SECONDS
+        last = before
+        observed = False
+        while time.monotonic() < deadline:
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            try:
+                last = status(min(500, remaining_ms))
+            except (usb.core.USBError, ValueError) as error:
+                raise RuntimeError('USB recovery outcome is ambiguous: reset was sent once, but status '
+                                   f'could not be verified ({error}). Do not retry automatically.') from error
+            observed = True
+            count = last['usb_reset_counter']
+            if count not in (before['usb_reset_counter'], expected):
+                raise RuntimeError('USB recovery outcome is ambiguous: dedicated reset counter changed '
+                                   'unexpectedly; another client or reset may have intervened. Do not retry automatically.')
+            if (count == expected and last['cleanup_generation'] == last['generation']
+                    and last['config'] != 0):
+                result = {'status': 'local_session_reset', 'reset_transfer_timed_out': timed_out,
+                          'old_request_replayed': False, 'before': before, 'after': last,
+                          'note': 'Local DAP session reset only; RF/target health is unverified. '
+                                  'Endpoint halts/suspend are preserved; close and reopen CDC with DTR low first.'}
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.05, remaining))
+        if observed and last['usb_reset_counter'] == before['usb_reset_counter']:
+            raise RuntimeError('USB recovery not committed: dedicated reset counter did not advance within 2 seconds. '
+                               'Reset was sent once; no automatic retry was performed.')
+        raise RuntimeError('USB recovery committed, but foreground cleanup/configuration was not ready within 2 seconds. '
+                           'Reset was sent once; no automatic retry was performed.')
+    except usb.core.NoBackendError as error:
+        raise RuntimeError('No PyUSB backend found; install a libusb backend and use WinUSB on interface 1') from error
+    except usb.core.USBError as error:
+        raise RuntimeError(usb_error_message(error)) from error
+    finally:
+        cleanup_errors = []
+        if claimed:
+            try:
+                usb.util.release_interface(selected, USB_INTERFACE)
+            except usb.core.USBError as error:
+                cleanup_errors.append(str(error))
+        for device in devices:
+            try:
+                usb.util.dispose_resources(device)
+            except usb.core.USBError as error:
+                cleanup_errors.append(str(error))
+        if cleanup_errors:
+            warning = 'USB resource cleanup failed: ' + '; '.join(cleanup_errors)
+            if result is not None:
+                result['cleanup_warning'] = warning
+            else:
+                # Preserve the primary failure, especially ambiguous reset outcomes.
+                print(warning, file=sys.stderr)
+
 
 def decode_config(raw):
     if len(raw) != 32 or raw[:6] != b'WRFC\x01\x20' or any(raw[21:24]):
@@ -79,6 +204,13 @@ def main():
     commands = parser.add_subparsers(dest='command', required=True)
     for name in ('info', 'stats', 'uart-stats', 'recovery-stats', 'reconnect', 'get-config', 'save', 'apply'):
         commands.add_parser(name)
+    for name in ('usb-status', 'usb-recover'):
+        commands.add_parser(name, help='Local EP0 USB management (WinUSB interface 1)',
+                            description=('Local EP0 USB management through PyUSB/WinUSB interface 1. '
+                                         'Stop all OpenOCD, pyOCD, HID/bulk debugger and CDC clients first. '
+                                         'usb-status is nonmutating; usb-recover clears the local DAP session '
+                                         'without sending a target request, preserving endpoint toggles/halts. '
+                                         'Recovery is sent once and is never automatically retried.'))
     commands.add_parser('discover')
     pair = commands.add_parser('pair')
     pair.add_argument('peer', help='16 hex digits from discover')
@@ -92,10 +224,17 @@ def main():
     config.add_argument('--save', action='store_true')
     config.add_argument('--apply', action='store_true')
     args = parser.parse_args()
-    if args.remote and args.command in ('discover', 'pair', 'reconnect'):
+    if args.remote and args.command in ('discover', 'pair', 'reconnect', 'usb-status', 'usb-recover'):
         parser.error('This command is local only')
     if args.command == 'configure' and args.idle_ms is not None and not 0 <= args.idle_ms <= 60000:
         parser.error('--idle-ms must be 0..60000')
+    if args.command in ('usb-status', 'usb-recover'):
+        try:
+            result = usb_management(args.command, args.serial)
+        except (RuntimeError, ValueError) as error:
+            parser.exit(1, f'{parser.prog}: {error}\n')
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     dev = Device(args.serial)
     call = lambda sub, data=b'': dev.command(sub, data, args.remote)
     try:

@@ -2,6 +2,10 @@
 
 本协议承载 CMSIS-DAP v1 的单个请求/响应，每次最多 64 字节；仅适用于本项目主从机。PHY 与 DMA 适配见 src/radio.c，编解码及从机去重见 src/link.c。
 
+## USB 控制恢复扩展（固件 1.3.4）
+
+USB WinUSB interface 1 新增独立 vendor EP0 STATUS/RESET，不经过本协议的 RF 请求队列：`c1/52 value=0 index=1 length=24` 返回 WUSB v1 状态，`41/52 value=5253 index=1 length=0` 在状态阶段确认后清理本地会话。保留 toggle/HALT，增加 USB generation 与专用计数，前台失效旧工作后确认代次。旧请求不跨会话重放。字段布局、工具和验证边界见 [USB 会话恢复](usb-recovery.md)。RF 帧格式保持如下。
+
 ## 帧格式
 
 RF payload 固定 78 字节，SDK DMA 在它前面另有 2 字节硬件头：`0x55` 和 payload 长度 `78`。RX DMA 至少 264 字节，按 SDK 要求分配；硬件 CRC 错误不投递到应用层。

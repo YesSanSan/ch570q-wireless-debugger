@@ -19,13 +19,15 @@ void usb_dap_init(void) {}
 void usb_dap_poll(void) {}
 bool usb_dap_configured(void) { return configured; }
 uint32_t usb_dap_generation(void) { return usb_gen; }
+void usb_dap_ack_generation(uint32_t tag) { (void)tag; }
 static unsigned discards;
-void usb_dap_discard_request(void) { ++discards; }
+bool usb_dap_discard_request_tagged(uint32_t tag) { (void)tag;++discards;return true; }
 bool usb_dap_take_request_tagged(uint8_t p[64],uint8_t *n,uint32_t *g) {
     if(!pending_usb)return false;
     memcpy(p,usb_req,64);*n=64;*g=tag_gen;pending_usb=false;return true;
 }
-bool usb_dap_send_response(const uint8_t *p,uint8_t n) {
+bool usb_dap_send_response_tagged(const uint8_t *p,uint8_t n,uint32_t tag) {
+    (void)tag;
     if(!allow_response)return false;
     memset(usb_reply,0,64);memcpy(usb_reply,p,n);++replies;return true;
 }

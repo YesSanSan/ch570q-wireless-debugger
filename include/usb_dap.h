@@ -16,6 +16,13 @@ typedef enum {
     USB_DAP_TRANSPORT_BULK = 2
 } usb_dap_transport_t;
 
+/* Independent WinUSB-interface EP0 management, available while DAP is busy.
+ * STATUS: c1/52 value=0 index=1 length=24, WUSB v1 snapshot.
+ * RESET: 41/52 value=5253 index=1 length=0, commit on status ACK.
+ * Explicit reset invalidates work, preserves endpoint toggles/halts; no replay. */
+#define WD_USB_RECOVERY_REQUEST 0x52u
+#define WD_USB_RECOVERY_MAGIC 0x5253u
+#define WD_USB_STATUS_SIZE 24u
 void usb_dap_init(void);
 void usb_dap_poll(void);
 /* Positive host evidence since init: BUS_RESET or SETUP, not VBUS sensing. */
@@ -41,6 +48,10 @@ bool usb_dap_discard_request_tagged(uint32_t request_generation);
 bool usb_dap_configured(void);
 uint32_t usb_dap_generation(void);
 usb_dap_transport_t usb_dap_transport(void);
+/* Foreground acknowledges that prior RF/application work was invalidated.
+ * A stale tag cannot acknowledge a newer reset. This does not confirm RF health
+ * or completion of CDC cancellation (DTR close is still required). */
+void usb_dap_ack_generation(uint32_t tag);
 /* Generation changes on init, reset, SET_CONFIGURATION, DAP SET_INTERFACE,
  * and accepted HID/Bulk transport switch. Compare the atomically captured tag
  * BEFORE executing DAP, reset the DAP engine when it changes, and tag replies.

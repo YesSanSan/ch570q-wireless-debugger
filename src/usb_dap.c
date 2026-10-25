@@ -102,10 +102,12 @@ enum control_state { CTRL_IDLE, CTRL_IN, CTRL_OUT, CTRL_STATUS_IN,
                      CTRL_STATUS_OUT, CTRL_STALL };
 enum action { ACT_NONE, ACT_ADDRESS, ACT_CONFIGURATION, ACT_INTERFACE,
               ACT_HALT_IN, ACT_HALT_OUT, ACT_CLEAR_IN, ACT_CLEAR_OUT,
-              ACT_IDLE, ACT_REPORT, ACT_LINE_CODING, ACT_CONTROL_LINE, ACT_BREAK };
+              ACT_IDLE, ACT_REPORT, ACT_LINE_CODING, ACT_CONTROL_LINE, ACT_BREAK,
+              ACT_DAP_RECOVER };
 
 static volatile uint8_t configuration, suspended, request_state;
 static volatile uint32_t generation;
+static volatile uint32_t usb_recoveries, cleanup_generation;
 static uint8_t request_length, halt_in, halt_out, idle_rate;
 static uint8_t control_state, control_action, action_value;
 static uint8_t control_out_length, control_zlp;
@@ -325,6 +327,13 @@ static void ep0_complete(void)
         ep1_update(); cdc_update();
         break;
     case ACT_IDLE: idle_rate = action_value; break;
+    case ACT_DAP_RECOVER:
+        /* UIF_TRANSFER + RB_UC_INT_BUSY fences SIE here. Retained previous
+         * completions are serviced before SETUP. Keep endpoint toggles/halts;
+         * clearing DMA in foreground with only USB IRQ masked is unsafe. */
+        dap_reset();
+        ++usb_recoveries;
+        break;
     case ACT_REPORT:
         if (request_state == REQ_CONTROL_STATUS) {
             select_transport(USB_DAP_TRANSPORT_HID);
@@ -374,7 +383,23 @@ static void ep0_setup(void)
     R8_UEP0_CTRL = RB_UEP_R_TOG | RB_UEP_T_TOG | UEP_R_RES_ACK | UEP_T_RES_NAK;
 
     bus_seen = true;
-    if (type == 0xc0 && req == MS_VENDOR_CODE && !value && index == 4) {
+    if (configuration && index == 1 && req == WD_USB_RECOVERY_REQUEST &&
+        type == 0xc1 && !value && length == WD_USB_STATUS_SIZE) {
+        /* Non-consuming snapshot, bounded below EP0+64 (CDC notification DMA). */
+        memcpy(ep0_buffer, "WUSB", 4);
+        ep0_buffer[4] = 1; ep0_buffer[5] = request_state;
+        ep0_buffer[6] = transport; ep0_buffer[7] = configuration;
+        ep0_buffer[8] = suspended; ep0_buffer[9] = halt_in;
+        ep0_buffer[10] = halt_out; ep0_buffer[11] = 0;
+        const uint32_t counters[] = {generation, usb_recoveries, cleanup_generation};
+        for (unsigned i = 0; i < 3; ++i)
+            for (unsigned j = 0; j < 4; ++j)
+                ep0_buffer[12 + i * 4 + j] = (uint8_t)(counters[i] >> (8 * j));
+        ep0_read(ep0_buffer, WD_USB_STATUS_SIZE, length); return;
+    } else if (configuration && index == 1 && req == WD_USB_RECOVERY_REQUEST &&
+               type == 0x41 && value == WD_USB_RECOVERY_MAGIC && !length) {
+        ep0_status(ACT_DAP_RECOVER, 0); return;
+    } else if (type == 0xc0 && req == MS_VENDOR_CODE && !value && index == 4) {
         ep0_read(ms_compat_id, sizeof(ms_compat_id), length); return;
     } else if (type == 0xc1 && req == MS_VENDOR_CODE && value == 1 && index == 5) {
         ep0_read(ms_properties, sizeof(ms_properties), length); return;
@@ -653,6 +678,7 @@ void usb_dap_init(void)
     R16_UEP3_DMA = (uint16_t)(uint32_t)ep3_buffer;
     suspended = 0;
     bus_seen = false;
+    usb_recoveries = cleanup_generation = 0;
     new_session(0);
     ep0_idle();
     R8_USB_DEV_AD = 0;
@@ -752,6 +778,12 @@ uint32_t usb_dap_generation(void)
 {
     uint32_t irq = usb_lock(), result;
     usb_service(); result = generation; usb_unlock(irq); return result;
+}
+void usb_dap_ack_generation(uint32_t tag)
+{
+    uint32_t irq = usb_lock(); usb_service();
+    if (tag == generation) cleanup_generation = tag;
+    usb_unlock(irq);
 }
 usb_dap_transport_t usb_dap_transport(void)
 {
